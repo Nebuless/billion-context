@@ -181,39 +181,28 @@ test("Responses short wire projection preserves main folds through the full requ
     }
 });
 
-test("e2e #301: overflow + summary upstream 429 → structured 503, over-window payload NOT forwarded", async () => {
+test("e2e #301: overflow + summary upstream 429 → payload forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
-    // The preflight summarization call hits the same rate-limited upstream as
-    // the main request (the #292 scenario).
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
-    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 20_000 } });
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        // Fresh session: a ~13k-token history against a 10k window — the
-        // payload itself overflows, preflight fires, its summarization call
-        // 429s. The proxy must fail fast, NOT forward the over-window body.
-        // (#4185) the 429 is relay-dependent, so the identified-fresh escape
-        // stays closed and this pin needs no evidence seeding.
+        // #7537: no local 413/503 rejections — the payload is ALWAYS forwarded
+        // and the upstream's response is the authoritative verdict.
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-429-sess" },
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
         });
-        assert.equal(r.status, 503, "fail-fast 503 when the summary upstream rate-limits");
-        const json = JSON.parse(await r.text()) as { error?: { type?: string; code?: string; message?: string; retryable?: boolean } };
-        assert.equal(json.error?.type, "server_error");
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.equal(json.error?.retryable, true);
-        assert.ok(json.error?.message?.includes("429"), `message names the cause (got: ${json.error?.message})`);
-        assert.ok(json.error?.message?.includes("NOT forwarded"), `message states the payload was withheld (got: ${json.error?.message})`);
-        assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded upstream");
-        assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight attempted the (429'd) summarization call");
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await r.text();
+        assert.ok(calls.filter((c) => c.stream).length >= 1, "the payload was forwarded upstream");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
@@ -294,7 +283,7 @@ test("e2e #301: fitting payload + stale usage floor → forwarded with zero summ
     }
 });
 
-test("e2e #301: over-window payload with nothing compressible → structured 413 (#3461), no summary call, no forward", async () => {
+test("e2e #301: over-window payload with nothing compressible → forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
@@ -326,14 +315,11 @@ test("e2e #301: over-window payload with nothing compressible → structured 413
                 ],
             }),
         });
-        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible (#3461: deterministic exhaustion is non-retryable)");
-        const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string; retryable?: boolean } };
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.equal(json.error?.retryable, false);
-        assert.ok(json.error?.message?.includes("NOT forwarded"), `message states the payload was withheld (got: ${json.error?.message})`);
-        assert.ok(json.error?.message?.includes("Raise the model context window"), `actionable error names the operator remedy (got: ${json.error?.message})`);
-        assert.equal(calls.filter((c) => !c.stream).length, 0, "no summarization call was spent on an incompressible payload");
-        assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded upstream");
+        // #7537: no local 413 — the payload is ALWAYS forwarded and the
+        // upstream's response is the authoritative verdict.
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await r.text();
+        assert.ok(calls.filter((c) => c.stream).length >= 1, "the payload was forwarded upstream");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
@@ -444,7 +430,7 @@ test("e2e #470: system + tools overhead counts in the preflight trigger — text
     }
 });
 
-test("e2e #736: operator-shrunk window (compress.modelContextLimit below the model's declared window) → fail-fast names the setting", async () => {
+test("e2e #736: operator-shrunk window → payload forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
@@ -452,9 +438,9 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
     const upstreamPort = (upstream.address() as { port: number }).port;
 
     // Same incompressible-payload shape as the #301 exhausted test, but the
-    // 4k window is an OPERATOR override of the model's declared 10k — the
-    // fail-fast must point at compress.modelContextLimit, not just say
-    // "raise the model context window" (which sends operators to the upstream).
+    // 4k window is an OPERATOR override of the model's declared 10k.
+    // #7537: no local 413 — the payload is ALWAYS forwarded and the
+    // upstream's response is the authoritative verdict.
     const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] }, { modelContextLimit: 4_000 });
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
@@ -475,42 +461,9 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
                 ],
             }),
         });
-        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible under the shrunken window (#3461)");
-        const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string } };
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        const msg = json.error?.message ?? "";
-        assert.ok(msg.includes("NOT forwarded"), `payload withheld (got: ${msg})`);
-        assert.ok(msg.includes("effective window 4000"), `names the shrunken effective window (got: ${msg})`);
-        assert.ok(msg.includes("full window 10000"), `names the model's full window (got: ${msg})`);
-        assert.ok(msg.includes("compress.modelContextLimit"), `points at the operator setting (got: ${msg})`);
-        assert.ok(!/\.\./.test(msg), `no doubled period (got: ${msg})`);
-        assert.equal(calls.length, 0, "no upstream call was spent on an incompressible payload");
-
-        // Negative control: the same payload with NO operator override must not
-        // carry the shrink note (effective === full window).
-        const proxyPlain = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] });
-        await once(proxyPlain, "listening");
-        const plainPort = (proxyPlain.address() as { port: number }).port;
-        seedEvidence("preflight-shrink-plain-sess", upstreamPort);
-        const r2 = await fetch(`http://127.0.0.1:${plainPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-plain-sess" },
-            body: JSON.stringify({
-                model: "claude-small",
-                max_tokens: 1024,
-                stream: true,
-                messages: [
-                    { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "bash", input: { command: "echo hi" } }] },
-                    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: filler }] },
-                ],
-            }),
-        });
-        assert.equal(r2.status, 413);
-        const msg2 = (JSON.parse(await r2.text()) as { error?: { message?: string } }).error?.message ?? "";
-        assert.ok(!msg2.includes("full window"), `no shrink note when the window was not operator-shrunk (got: ${msg2})`);
-        proxyPlain.close();
-        proxyPlain.closeIdleConnections?.();
-        await once(proxyPlain, "close");
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await r.text();
+        assert.ok(calls.filter((c) => c.stream).length >= 1, "the payload was forwarded upstream");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
@@ -529,7 +482,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
 // (the pre-fix logic) therefore blamed compress.modelContextLimit for a reduction
 // the operator never made. This guards that path: an OpenAI-chat incompressible
 // payload under a headroom-shrunk window must NOT carry the shrink note.
-test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator override) → fail-fast does NOT name compress.modelContextLimit", async () => {
+test("e2e #737: output-headroom-shrunk window → payload forwarded, upstream 200 is the verdict (#7537)", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
@@ -539,7 +492,9 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
     // Model declares a 10k window (registry table), NO operator override. The
     // OpenAI-chat endpoint reserves output headroom: max_tokens 4000 shrinks the
     // effective window 10000 -> 6000. A ~12k incompressible (hard-protected bash)
-    // tool result overflows 6000 → fail-fast.
+    // tool result overflows 6000.
+    // #7537: no local 413 — the payload is ALWAYS forwarded and the
+    // upstream's response is the authoritative verdict.
     const proxy = await startProxy(upstreamPort, { "gpt-small": { context: 10_000 } }, { protectedTools: ["bash"] });
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
@@ -560,21 +515,9 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
                 ],
             }),
         });
-        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible under the headroom-shrunk window (#3461)");
-        const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string } };
-        assert.equal(json.error?.code, "preflight_compress_failed");
-        const msg = json.error?.message ?? "";
-        assert.ok(msg.includes("NOT forwarded"), `payload withheld (got: ${msg})`);
-        // Proves the headroom path was exercised: the reported window is the
-        // 7500 after the #896-capped headroom reservation (min(max_tokens,
-        // outputHeadroomMaxPct·window) = min(4000, 2500) = 2500 off 10000), not
-        // the declared 10000.
-        assert.ok(msg.includes("model window 7500"), `effective window reflects headroom reservation (got: ${msg})`);
-        // Regression guard: the reduction here came from output-headroom, NOT an
-        // operator setting — the shrink note must stay silent.
-        assert.ok(!msg.includes("full window"), `no shrink note for a headroom-shrunk window (got: ${msg})`);
-        assert.ok(!msg.includes("compress.modelContextLimit"), `does not blame an untouched operator setting (got: ${msg})`);
-        assert.equal(calls.length, 0, "no upstream call was spent on an incompressible payload");
+        assert.equal(r.status, 200, "payload is forwarded, upstream 200 is the verdict");
+        await r.text();
+        assert.ok(calls.filter((c) => c.stream).length >= 1, "the payload was forwarded upstream");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

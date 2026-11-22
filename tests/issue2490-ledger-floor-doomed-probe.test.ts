@@ -75,6 +75,14 @@ function makeUpstream(): { server: http.Server; calls: Call[] } {
                     res.end(JSON.stringify({ id: "chatcmpl-sum", object: "chat.completion", model: "gpt-test", choices: [{ index: 0, message: { role: "assistant", content: SUMMARY_TEXT }, finish_reason: "stop" }] }));
                     return;
                 }
+                // #7537: the upstream enforces the window — over-window payloads
+                // get a real 400 with the provider's own numbers.
+                const estTokens = Math.ceil(chars / 4);
+                if (estTokens > WINDOW) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { message: `context_length_exceeded: ${estTokens} > ${WINDOW}`, type: "invalid_request_error" } }));
+                    return;
+                }
                 res.writeHead(200, { "content-type": "text/event-stream" });
                 res.end(chatSse("forwarded answer", { prompt_tokens: Math.max(1, Math.round(chars / 40)), completion_tokens: 3 }));
             } catch {
@@ -279,23 +287,22 @@ test("e2e #2490 a: the guard records the refused replay SIZE on the session (hig
 // ---------------------------------------------------------------------------
 // (b) doomed probe
 
-test("e2e #2490 b: multi-MB core text beyond both doom bars fails fast instead of paying the probe 400", async () => {
+test("e2e #2490 b: multi-MB core text is forwarded, upstream 400 is the verdict (#7537)", async () => {
     const { ctx, calls, close } = await setup();
     try {
         await seedStuckMeter(ctx, "s-2490-b");
 
-        // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — past the absolute
-        // 2MB bar (and the 20K window × 7.5 B/token = 150KB ratio bar).
+        // 500 msgs × 4.4K chars ≈ 2.2MB of ASCII core text — over the 20K window.
+        // #7537: no local-estimation 413 — the payload is forwarded and the
+        // upstream's real size error is the authoritative verdict.
         const r = await post(ctx, bigMessages(500, 4_400));
-        // #2847: 413 (was 502) — a mathematically-determined rejection must be
-        // non-retryable at the status-code layer, or status-driven hosts retry
-        // the identical doomed payload (3 crashes in 10s in the field).
-        assert.equal(r.status, 413, "doomed probe fails fast with NON-retryable 4xx semantics, not forwarded");
+        assert.equal(r.status, 400, "over-window payload is forwarded, upstream 400 is the verdict");
         const body = await r.text();
-        assert.match(body, /~22\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(body, /NOT forwarded even for evidence/, "the remedy wording is present");
+        assert.ok(body.includes("context_length_exceeded"), `upstream error passed through: ${body.slice(0, 300)}`);
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "x-bili-retryable: false on upstream size error");
 
-        assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))}) — never the 2.2MB payload`);
+        const forwards = calls.filter((c) => !c.summary);
+        assert.ok(forwards.length >= 2, `the payload was forwarded (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
     } finally {
         await close();
     }
@@ -314,8 +321,9 @@ test("e2e #2490 c: an experiment-sized payload still probes (control — #2313/#
         assert.equal(r.status, 200, "probe forward reaches the upstream");
         await r.text();
 
-        assert.equal(calls.filter((c) => !c.summary).length, 2, "turn 1 + exactly one probe forward");
-        assert.equal(calls.filter((c) => c.summary).length, 0, "no summarization before evidence");
+        assert.ok(calls.filter((c) => !c.summary).length >= 2, `turn 1 + probe forward(s) (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
+        // #7537: the upstream enforces the window, so the preflight compression
+        // may trigger summary calls to reduce the payload to fit within the window.
         const s = getSession("s-2490-c");
         assert.ok(s);
         assert.equal(s.stats.lastInputTokensSource, "usage", "the probe still settles a usage baseline");
@@ -350,23 +358,20 @@ async function runDoomedScenario(
     }
 }
 
-test("e2e #4079: the doomed 413 logs one core-text profile line, reading an all-distinct payload as GROWN", async () => {
+test("e2e #4079: over-window payload is forwarded, no local profile line (#7537)", async () => {
     // Same shape as (b): 500 msgs × 4.4K chars ≈ 2.2MB core text — but every
-    // message is unique (`turn i:` prefix), so the ratio must read near zero:
-    // the payload grew by content, not by repetition.
+    // message is unique (`turn i:` prefix). #7537: no local 413, so no
+    // profile line — the payload is forwarded and the upstream 400 is the verdict.
     const { status, profiles } = await runDoomedScenario("s-4079-grew", bigMessages(500, 4_400));
-    assert.equal(status, 413, "still fails fast on the same bars");
-    assert.equal(profiles.length, 1, "exactly one profile line accompanies the refusal");
-    assert.match(profiles[0]!, /\d+ message\(s\), \d+B core over \d+ distinct text\(s\), \d+B unique/);
-    assert.match(profiles[0]!, /duplicateRatio=0\.0\d{2}/, "unique-per-message payload → growth, not repetition");
+    assert.equal(status, 400, "over-window payload is forwarded, upstream 400 is the verdict");
+    assert.equal(profiles.length, 0, "no local profile line (no local 413, #7537)");
 });
 
-test("e2e #4079: the doomed 413 reads a repeated-text payload as REPEATED (the #4079 incident shape)", async () => {
+test("e2e #4079: repeated-text over-window payload is forwarded, no local profile line (#7537)", async () => {
     const blob = "r".repeat(4_400);
     const { status, profiles } = await runDoomedScenario("s-4079-repeat", Array.from({ length: 500 }, () => ({ role: "user", content: blob })));
-    assert.equal(status, 413, "the identical byte mass still trips the same bars");
-    assert.equal(profiles.length, 1, "exactly one profile line accompanies the refusal");
-    assert.match(profiles[0]!, /duplicateRatio=0\.9\d{2}/, "one blob repeated 500× → repetition, not growth");
+    assert.equal(status, 400, "over-window payload is forwarded, upstream 400 is the verdict");
+    assert.equal(profiles.length, 0, "no local profile line (no local 413, #7537)");
 });
 
 test("e2e #4079: the non-doomed probe forward logs NO profile line (negative direction, #3617)", async () => {

@@ -64,6 +64,14 @@ function makeUpstream(): { server: http.Server; calls: Call[] } {
                     res.end(JSON.stringify({ id: "chatcmpl-sum", object: "chat.completion", model: "gpt-test", choices: [{ index: 0, message: { role: "assistant", content: "PREFLIGHT SUMMARY: filler." }, finish_reason: "stop" }] }));
                     return;
                 }
+                // #7537: the upstream enforces the window — over-window payloads
+                // get a real 400 with the provider's own numbers.
+                const estTokens = Math.ceil(chars / 4);
+                if (estTokens > WINDOW) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { message: `context_length_exceeded: ${estTokens} > ${WINDOW}`, type: "invalid_request_error" } }));
+                    return;
+                }
                 res.writeHead(200, { "content-type": "text/event-stream" });
                 res.end(chatSse("forwarded answer", { prompt_tokens: Math.max(1, Math.round(chars / 40)), completion_tokens: 3 }));
             } catch {
@@ -155,31 +163,27 @@ async function seedStuckMeter(ctx: Ctx, sessionId: string, lastInputTokens = 7_3
     s.stats.lastInputTokensOrigin = "http://127.0.0.1:1";
 }
 
-test("e2e #2847: a mathematically-doomed payload answers NON-retryable 4xx semantics, not a 502 the host must retry", async () => {
+test("e2e #2847: over-window payload is forwarded, upstream 400 is the verdict, x-bili-retryable:false (#7537)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-2847-"));
     const { ctx, calls, close } = await setup();
     try {
         await seedStuckMeter(ctx, "s-2847-a");
 
-        // 500 msgs × 4.4K chars ≈ 2.2MB ASCII core text — past BOTH doom bars
-        // (absolute 2MB floor; 20K window × 7.5 B/token = 150KB ratio bar).
-        // This is the issue's shape: ~2,234,634 bytes rejected 3× in 10s.
+        // 500 msgs × 4.4K chars ≈ 2.2MB ASCII core text — over the 20K window.
+        // #7537: no local-estimation 413 — the payload is forwarded and the
+        // upstream's real size error is the authoritative verdict.
         const r = await post(ctx, bigMessages());
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { code?: string; retryable?: boolean; message?: string } };
 
-        // THE fix under test: the status itself must carry the non-retryable
-        // semantics. 502 is a transient gateway failure for every status-code
-        // -driven host; 413 is terminal.
-        assert.equal(r.status, 413, `doomed overflow must answer 413 (got ${r.status}) — a 502 re-invites the host retry storm (#2847)`);
-        assert.ok(r.status >= 400 && r.status < 500, "doomed overflow is a 4xx (non-retryable class), never a 5xx");
-        // Everything else pinned by #2490 stays byte-identical in meaning:
-        assert.equal(parsed.error?.code, "preflight_compress_failed", "same structured error code");
-        assert.equal(parsed.error?.retryable, false, "body still says retryable:false");
-        assert.match(parsed.error?.message ?? "", /~2[23]\d{5} bytes/, "the byte math is in the operator-facing message");
-        assert.match(parsed.error?.message ?? "", /NOT forwarded even for evidence/, "the remedy wording is present");
-        // Behavior unchanged: the doomed payload NEVER reaches the upstream.
-        assert.ok(calls.length === 1 && calls[0]!.contentChars < 50_000, `only the seed turn reached the upstream (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
+        // THE new behavior: the payload is forwarded and the upstream's 400
+        // is passed through with x-bili-retryable:false (non-retryable
+        // semantics for every status-code-driven host).
+        assert.equal(r.status, 400, `over-window payload must be forwarded and the upstream 400 is the verdict (got ${r.status})`);
+        assert.ok(body.includes("context_length_exceeded"), `upstream error passed through: ${body.slice(0, 300)}`);
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "x-bili-retryable: false on upstream size error");
+        // The payload WAS forwarded (not locally rejected).
+        const forwards = calls.filter((c) => !c.summary);
+        assert.ok(forwards.length >= 1, `the payload was forwarded (calls=${JSON.stringify(calls.map((c) => c.contentChars))})`);
     } finally {
         await close();
         rmrf(root);
