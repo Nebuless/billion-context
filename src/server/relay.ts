@@ -2169,7 +2169,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // payload and burn rate limit. The body is relayed byte-exact (wire
         // fidelity); this header is additive and carries no body mutation.
         {
-            const errBodyText = typeof errBody === "string" ? errBody : "";
+            const errBodyText = errBody ? errBody.toString("utf8") : "";
             const ovf = inspectContextOverflow(upstream.status, errBodyText);
             const isSizeError = ovf.isOverflow || isMarkerlessOverflowReject(upstream.status, errBodyText);
             if (isSizeError) {

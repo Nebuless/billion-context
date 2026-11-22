@@ -212,31 +212,34 @@ test("usage-backed session: over the headroom limit, zero compressible → forwa
     });
 });
 
-test("identified fresh session whose MEASURED body exceeds the native window but clears the 2MB byte floor → still fail-fast 413, nothing forwarded (#5000/#4185 measured tier)", async () => {
+test("identified fresh session whose MEASURED body exceeds the native window → forwarded, upstream 400 is the verdict (#7537)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
         // 300K chars of tool-result text ≈ ~75K measured tokens: over the 40K
-        // native window, but only ~300KB — ~7× under the 2MB core-text byte
-        // floor, which the old path alone let ride to a guaranteed 400.
+        // native window. #7537: no local-estimation 413 — the payload is
+        // forwarded and the upstream's real size error is the verdict.
         const r = await post(proxyPort, upstreamPort, "s-4185-measured", incidentConversation(300_000));
         const body = await r.text();
-        assert.equal(r.status, 413, `measured-over body must fail fast: ${body.slice(0, 300)}`);
-        assert.match(body, /outbound body measures ~[\d,]+ TEXT tokens even after preflight compression/, `measured diagnostic present: ${body.slice(0, 300)}`);
-        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom wording present: ${body.slice(0, 300)}`);
-        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 0, "the giant payload was never forwarded");
+        assert.equal(r.status, 400, `measured-over body must be forwarded and the upstream 400 is the verdict: ${body.slice(0, 300)}`);
+        assert.ok(body.includes("context_length_exceeded"), `upstream error passed through: ${body.slice(0, 300)}`);
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "x-bili-retryable: false on upstream size error");
+        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 1, "the giant payload was forwarded");
     });
 });
 
-test("identified fresh session with mathematically doomed bytes (>2MB core) → still fail-fast 413, nothing forwarded (#4185 negative)", async () => {
+test("identified fresh session with large body → forwarded, upstream 400 is the verdict (#7537)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
+        // #7537: no local-estimation 413 — the payload is forwarded and the
+        // upstream's real size error is the verdict.
         const r = await post(proxyPort, upstreamPort, "s-4185-doomed", incidentConversation(2_100_000));
         const body = await r.text();
-        assert.equal(r.status, 413, "doomed bytes must still fail fast");
-        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom diagnostic present: ${body.slice(0, 300)}`);
-        assert.equal(calls.length, 0, "nothing forwarded and no summarization spent");
+        assert.equal(r.status, 400, `large body must be forwarded and the upstream 400 is the verdict: ${body.slice(0, 300)}`);
+        assert.ok(body.includes("context_length_exceeded"), `upstream error passed through: ${body.slice(0, 300)}`);
+        assert.equal(r.headers.get("x-bili-retryable"), "false", "x-bili-retryable: false on upstream size error");
+        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 1, "the giant payload was forwarded");
     });
 });
 
-test("usage-backed session whose payload exceeds the NATIVE window → forwarded once, the 400 stamps the wall, the resend fails fast 413 locally (#4185 negative)", async () => {
+test("usage-backed session whose payload exceeds the NATIVE window → forwarded, upstream 400 is the verdict; resend also forwarded (#7537)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
         const small = await post(proxyPort, upstreamPort, "s-4185-native-over", [
             { role: "user", content: "hello" },
@@ -246,21 +249,20 @@ test("usage-backed session whose payload exceeds the NATIVE window → forwarded
         assert.equal(small.status, 200);
 
         // ~45k realistic tokens: over the 40000 NATIVE window itself — no
-        // clamp can make input+output fit. Identity fast path: the session's
-        // recorded same-origin reality outranks the local doom-math, so this
-        // payload is forwarded once and the upstream's 400 is the verdict.
+        // clamp can make input+output fit. #7537: no local-estimation 413 —
+        // the payload is forwarded and the upstream's 400 is the verdict.
         const giant = incidentConversation(180_000);
         const r = await post(proxyPort, upstreamPort, "s-4185-native-over", giant);
         const body = await r.text();
-        assert.ok(r.status === 400 || r.status === 413, `over-native payload is rejected after the experiment, got ${r.status}: ${body.slice(0, 200)}`);
-        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 1, "the giant payload was forwarded exactly once");
+        assert.equal(r.status, 400, `over-native payload must be forwarded and the upstream 400 is the verdict: ${body.slice(0, 200)}`);
+        assert.ok(body.includes("context_length_exceeded"), `upstream error passed through: ${body.slice(0, 200)}`);
+        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 1, "the giant payload was forwarded");
 
-        // The 400 stamped the session wall (overflowArmTokens) — the identical
-        // resend now fails fast locally: 413, nothing new reaches upstream.
+        // #7537: no local 413 rejections — the resend is also forwarded.
         const before = calls.length;
         const r2 = await post(proxyPort, upstreamPort, "s-4185-native-over", giant);
         const body2 = await r2.text();
-        assert.equal(r2.status, 413, `the resend must fail fast 413 after the wall is stamped, got ${r2.status}: ${body2.slice(0, 200)}`);
-        assert.equal(calls.length, before, "the resented payload was never forwarded again");
+        assert.equal(r2.status, 400, `the resend must also be forwarded and get the upstream 400: ${body2.slice(0, 200)}`);
+        assert.equal(calls.length, before + 1, "the resented payload was forwarded again");
     });
 });
