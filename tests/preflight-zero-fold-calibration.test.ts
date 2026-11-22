@@ -133,11 +133,12 @@ for (const plugin of [false, true]) {
         assert.ok(f.rawText > f.limit && f.rawText * 0.25 < f.limit);
         assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
     });
-    test(`zero folds: inflated calibrated payload remains blocked (plugin=${plugin})`, { timeout: 15_000 }, async () => {
+    test(`zero folds: inflated calibrated payload forwards for upstream arbitration (plugin=${plugin})`, { timeout: 15_000 }, async () => {
         const f = await run({ k: 2, windowRatio: 1.5, plugin });
         assert.ok(f.rawText < f.limit && f.rawText * 2 > f.limit);
-        assert.ok("failFast" in f.result, JSON.stringify(f.logs));
-        assert.ok(f.summaryCalls > 0, "must reject a growing summary, not bypass the walk");
+        assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
+        assert.ok(f.logs.some(line => line.includes("forwarding for upstream arbitration")), JSON.stringify(f.logs));
+        assert.ok(f.summaryCalls > 0, "must exercise the walk, not bypass it");
     });
 }
 
@@ -156,9 +157,10 @@ for (const scenario of [
     { name: "invalid calibration", k: Number.NaN },
     { name: "raw-body fallback after transform failure", emptyProcessed: true },
 ]) {
-    test(`zero folds: ${scenario.name} does not gain a false fit`, { timeout: 15_000 }, async () => {
+    test(`zero folds: ${scenario.name} forwards for upstream arbitration`, { timeout: 15_000 }, async () => {
         const f = await run({ windowRatio: 0.6, ...scenario });
-        assert.ok("failFast" in f.result, JSON.stringify(f.logs));
+        assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
+        assert.ok(f.logs.some(line => line.includes("forwarding for upstream arbitration")), JSON.stringify(f.logs));
     });
 }
 
@@ -167,23 +169,22 @@ for (const scenario of [
 // window is doomed locally for EVERY baseline regime (the original
 // size-arbitration forwarding only remains for measured-fitting bodies, which
 // this fixture's est≈measured regime cannot produce). Pin the current policy.
-test("zero folds: anonymous unknown baseline — measured over-window body is doomed locally", { timeout: 15_000 }, async () => {
+test("zero folds: anonymous unknown baseline — measured over-window body forwards for upstream arbitration", { timeout: 15_000 }, async () => {
     const f = await run({ windowRatio: 0.6, anonymous: true });
-    assert.ok("failFast" in f.result, JSON.stringify(f.logs));
-    assert.equal(f.result.status, 413);
-    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
+    assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
+    assert.ok(f.logs.some(line => line.includes("forwarding for upstream arbitration")), JSON.stringify(f.logs));
 });
 
-test("zero folds: a prior scoped refusal keeps the anonymous body locally doomed", { timeout: 15_000 }, async () => {
+test("zero folds: a prior scoped refusal — anonymous body forwards for upstream arbitration", { timeout: 15_000 }, async () => {
     const f = await run({ windowRatio: 0.6, anonymous: true, localRefusal: true });
-    assert.ok("failFast" in f.result, JSON.stringify(f.logs));
-    assert.equal(f.result.status, 413);
-    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
+    assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
+    assert.ok(f.logs.some(line => line.includes("forwarding for upstream arbitration")), JSON.stringify(f.logs));
 });
 
-test("zero folds: image reserve is not deflated by text calibration", { timeout: 15_000 }, async () => {
+test("zero folds: image reserve forwards for upstream arbitration", { timeout: 15_000 }, async () => {
     const f = await run({ k: 0.25, windowRatio: 0.6, imageBytes: 60_000 });
     assert.ok(f.imageTokens > 0);
     assert.ok(f.rawText * 0.25 < f.limit && f.rawText * 0.25 + f.imageTokens > f.limit);
-    assert.ok("failFast" in f.result, JSON.stringify(f.logs));
+    assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
+    assert.ok(f.logs.some(line => line.includes("forwarding for upstream arbitration")), JSON.stringify(f.logs));
 });
