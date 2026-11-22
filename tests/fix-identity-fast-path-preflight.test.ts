@@ -250,7 +250,7 @@ test("e2e identity fast path: identified sid + same-origin upstream reality outr
     }
 });
 
-test("e2e identity fast path fires: a TEXT doom verdict (no images) is converted by the fast path itself, not the #496/#1800 hatch", async () => {
+test("e2e identity fast path fires: a TEXT doom verdict (no images) is converted by the fast path itself, not the #496/#1800 hatch (#7537)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-identity-"));
     const { ctx, calls, close } = await setup();
     const logs: string[] = [];
@@ -261,21 +261,16 @@ test("e2e identity fast path fires: a TEXT doom verdict (no images) is converted
 
         // TEXT-dominated doomed shape (issue2847: 500 msgs × 4.4K chars ≈ 2.2MB
         // — past BOTH doom bars; NO images, so the #496/#1800 image-arbitration
-        // hatch cannot intercept). This is the shape that reaches the doom-math
-        // sites and is converted by the identity fast path itself (test A's
-        // image payload is caught earlier by the image hatch, so it does NOT
-        // pin this gate — #3617: the positive direction needs its own row).
+        // hatch cannot intercept). #7537: the payload is ALWAYS forwarded; the
+        // upstream's verdict is authoritative.
         const r = await post(ctx, bigMessages());
         const body = await r.text();
 
-        assert.equal(r.status, 200, `trusted same-origin+model TEXT doom must forward (got ${r.status}); body=${body.slice(0, 300)}`);
+        assert.equal(r.status, 200, `payload is forwarded, upstream 200 is the verdict (got ${r.status}); body=${body.slice(0, 300)}`);
         assert.match(body, /forwarded answer/, "the payload actually reached the upstream");
         const since = calls.slice(before);
-        assert.equal(since.length, 1, `exactly one upstream call for the forward (got ${JSON.stringify(since)})`);
-        assert.equal(since[0]!.summary, false);
-        // THE fast path line specifically — the #496/#1800 arbitration line is
-        // image-only and must NOT be the carrier for a text payload.
-        assert.ok(logs.some((m) => m.includes("identity fast path") && !m.includes("demoted")), "log carries the identity fast path conversion line");
+        assert.ok(since.length >= 1, `at least one upstream call for the forward (got ${JSON.stringify(since)})`);
+        assert.ok(since.some((c) => !c.summary), "the payload was forwarded");
         assert.ok(!logs.some((m) => m.includes("arbitrate billing (#496/#1800)")), "the text payload did not ride the image-arbitration hatch");
     } finally {
         setLogCapture(null);
@@ -284,7 +279,7 @@ test("e2e identity fast path fires: a TEXT doom verdict (no images) is converted
     }
 });
 
-test("e2e identity fast path demotion: usage-grade reality on ANOTHER origin stays demoted — the 413 veto holds (#1933, #2847)", async () => {
+test("e2e identity fast path demotion: usage-grade reality on ANOTHER origin stays demoted — payload forwarded (#7537)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-identity-"));
     const { ctx, calls, close } = await setup();
     const logs: string[] = [];
@@ -292,8 +287,8 @@ test("e2e identity fast path demotion: usage-grade reality on ANOTHER origin sta
     try {
         // usage-grade reality exists — but on a FOREIGN origin. The fast path
         // must stay closed (a bill from another provider is not evidence for
-        // this lane, #1933 F2); with no current-route reality left, the local
-        // doom-math keeps its #2847 veto.
+        // this lane, #1933 F2). #7537: the payload is ALWAYS forwarded; the
+        // upstream's verdict is authoritative.
         await seedTrusted(ctx, "s-id-stale-origin", { source: "usage", origin: "http://127.0.0.1:1" });
         const before = calls.length;
 
@@ -302,13 +297,11 @@ test("e2e identity fast path demotion: usage-grade reality on ANOTHER origin sta
         // cannot intercept).
         const r = await post(ctx, bigMessages());
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { code?: string; retryable?: boolean; message?: string } };
 
-        assert.equal(r.status, 413, `stale-origin reality must NOT open the fast path (got ${r.status}); body=${body.slice(0, 300)}`);
-        assert.equal(parsed.error?.code, "preflight_compress_failed");
-        assert.equal(parsed.error?.retryable, false);
+        assert.equal(r.status, 200, `payload is forwarded, upstream 200 is the verdict (got ${r.status}); body=${body.slice(0, 300)}`);
         const since = calls.slice(before);
-        assert.ok(since.every((c) => c.summary), "the doomed payload was not forwarded (only summary calls, if any)");
+        assert.ok(since.length >= 1, `at least one upstream call (got ${JSON.stringify(since)})`);
+        assert.ok(since.some((c) => !c.summary), "the payload was forwarded");
         assert.ok(logs.some((m) => m.includes("identity fast path demoted")), "log carries the demotion line");
         assert.ok(!logs.some((m) => /identity fast path(?! demoted)/.test(m)), "no fast-path conversion line for stale-origin evidence");
     } finally {
@@ -318,7 +311,7 @@ test("e2e identity fast path demotion: usage-grade reality on ANOTHER origin sta
     }
 });
 
-test("e2e identity fast path demotion: a MODEL change since the last evidence keeps the 413 veto (#2117 model gate)", async () => {
+test("e2e identity fast path demotion: a MODEL change since the last evidence keeps the demotion — payload forwarded (#7537)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-identity-"));
     const { ctx, calls, close } = await setup();
     const logs: string[] = [];
@@ -327,10 +320,8 @@ test("e2e identity fast path demotion: a MODEL change since the last evidence ke
         // Same origin, usage-grade reality ≥ window — but the session last ran
         // on a DIFFERENT model. Acceptance evidence is per model (#2117: a bill
         // on claude-big binds nothing for claude-small), so the fast path must
-        // stay closed and the local doom-math keeps its #2847 veto. This is the
-        // model-mismatch negative direction of the gate — #3617 requires it to
-        // be pinned (the PR body's "regression-covered by #2189" claim does not
-        // hold: #2189's cross-model turns never exercise this gate).
+        // stay closed. #7537: the payload is ALWAYS forwarded; the upstream's
+        // verdict is authoritative.
         await seedTrusted(ctx, "s-id-stale-model");
         const s = getSession("s-id-stale-model");
         assert.ok(s, "session exists after seed");
@@ -341,13 +332,11 @@ test("e2e identity fast path demotion: a MODEL change since the last evidence ke
         // arbitration cannot intercept — the model gate is what must judge).
         const r = await post(ctx, bigMessages());
         const body = await r.text();
-        const parsed = JSON.parse(body) as { error?: { code?: string; retryable?: boolean; message?: string } };
 
-        assert.equal(r.status, 413, `stale-model reality must NOT open the fast path (got ${r.status}); body=${body.slice(0, 300)}`);
-        assert.equal(parsed.error?.code, "preflight_compress_failed");
-        assert.equal(parsed.error?.retryable, false);
+        assert.equal(r.status, 200, `payload is forwarded, upstream 200 is the verdict (got ${r.status}); body=${body.slice(0, 300)}`);
         const since = calls.slice(before);
-        assert.ok(since.every((c) => c.summary), "the doomed payload was not forwarded (only summary calls, if any)");
+        assert.ok(since.length >= 1, `at least one upstream call (got ${JSON.stringify(since)})`);
+        assert.ok(since.some((c) => !c.summary), "the payload was forwarded");
         assert.ok(logs.some((m) => m.includes("identity fast path demoted")), "log carries the demotion line");
         assert.ok(!logs.some((m) => /identity fast path(?! demoted)/.test(m)), "no fast-path conversion line for stale-model evidence");
     } finally {
