@@ -9,6 +9,15 @@
 // alone; this file pins the FUSE path end to end (both gates that share the
 // meter: the relay fuse and preflight's measured bar) so a regression to
 // "count everything" fails here, not in the field.
+//
+// #7168/#7439 intercept (240a2e55374): bili now STRIPS top-level `dsh_*` from
+// the inbound body by default (rollout `passDshExtensions` percent:0) so the
+// 8 MiB never rides to a non-DeepSeek upstream. Two relay cases are pinned:
+//   (1) DEFAULT (strip): the extension is dropped, the small real prompt
+//       forwards, and neither gate trips.
+//   (2) PASS-THROUGH (release path, BILI_ROLLOUT_PASS_DSH_EXTENSIONS=1): the
+//       extension rides along AND neither gate trips on it — the original
+//       #7013/#7189 fuse-blindness pin, kept for when the intercept is released.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -120,8 +129,11 @@ async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => void }> 
     };
 }
 
-test("e2e #7013: an 8 MiB top-level dsh_session_log does NOT trip the relay egress fuse — the small real prompt forwards (pre-f6e891d the same body was a local 413 egress_window_fuse every round)", async () => {
+test("e2e #7013 (pass-through): an 8 MiB top-level dsh_session_log does NOT trip the relay egress fuse — the small real prompt forwards AND the extension rides along (release path; pre-f6e891d the same body was a local 413 egress_window_fuse every round)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-7013a-"));
+    // Release path: force the #7168/#7439 intercept OFF so the extension rides
+    // to the upstream and the fuse-blindness is actually exercised.
+    process.env.BILI_ROLLOUT_PASS_DSH_EXTENSIONS = "1";
     const { ctx, calls, close } = await setup();
     try {
         // No `model` in the body → preflight's `!model` early return skips its
@@ -146,13 +158,47 @@ test("e2e #7013: an 8 MiB top-level dsh_session_log does NOT trip the relay egre
         // forwarding, not stripping: the upstream saw the whole ~8 MiB body.
         assert.ok(calls[0]!.bytes > 7_900_000, `upstream should receive the full body incl. the extension (got ${calls[0]!.bytes}B)`);
     } finally {
+        delete process.env.BILI_ROLLOUT_PASS_DSH_EXTENSIONS;
         await close();
         rmrf(root);
     }
 });
 
-test("e2e #7189: same shape WITH model present — preflight's measured gate (the second consumer of the same meter, armMeasuredBar) must not 413 either", async () => {
+test("e2e #7013 (default intercept): the 8 MiB top-level dsh_session_log is STRIPPED before egress (#7168/#7439) — the small real prompt forwards and neither gate trips", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7013d-"));
+    // Default posture (passDshExtensions percent:0): the top-level dsh_* is
+    // dropped by withoutDshClientExtensions before the body is metered/forwarded.
+    delete process.env.BILI_ROLLOUT_PASS_DSH_EXTENSIONS;
+    const { ctx, calls, close } = await setup();
+    try {
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "continue the refactor" }],
+                dsh_session_log: { version: 1, sessionId: "sess-7013d", events: dshSessionLog() },
+            }),
+        });
+        const body = await r.text();
+
+        assert.equal(r.status, 200, `the small real prompt must forward despite the 8 MiB telemetry extension (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(calls.length, 1, "the request reached the upstream");
+        // The 8 MiB extension must NOT ride to the upstream — only the small
+        // real prompt (~tens of KB) does. A regression to forwarding it would
+        // push the bytes far past this bound.
+        assert.ok(calls[0]!.bytes < 100_000, `the 8 MiB dsh_session_log must be stripped before egress, not forwarded (got ${calls[0]!.bytes}B)`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #7189 (pass-through): same shape WITH model present — preflight's measured gate (the second consumer of the same meter, armMeasuredBar) must not 413 either, and the extension rides along", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-7189-"));
+    // Release path: force the #7168/#7439 intercept OFF so the extension rides
+    // to the upstream and the measured-bar blindness is actually exercised.
+    process.env.BILI_ROLLOUT_PASS_DSH_EXTENSIONS = "1";
     const { ctx, calls, close } = await setup();
     try {
         const r = await fetch(ctx.url, {
@@ -171,6 +217,7 @@ test("e2e #7189: same shape WITH model present — preflight's measured gate (th
         assert.equal(calls.length, 1, "the request reached the upstream");
         assert.ok(calls[0]!.bytes > 7_900_000, `upstream should receive the full body incl. the extension (got ${calls[0]!.bytes}B)`);
     } finally {
+        delete process.env.BILI_ROLLOUT_PASS_DSH_EXTENSIONS;
         await close();
         rmrf(root);
     }
