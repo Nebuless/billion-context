@@ -357,7 +357,7 @@ export async function prepareGoogle(
         // system is assembled below, so the recorded system row is the
         // lane's OUTBOUND system.
         const laneCoreForRecord = egressMessages;
-        rebuiltContents = coreToGoogle(egressMessages, { model });
+        rebuiltContents = coreToGoogle(egressMessages, { model, originalMessages });
 
         // ONLY the static compress prompt joins the client's system text — the
         // system instruction is the prefix-cache anchor and must stay
@@ -402,7 +402,7 @@ export async function prepareGoogle(
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log);
                 if (served !== null) {
-                    rebuiltContents = coreToGoogle(served, { model });
+                    rebuiltContents = coreToGoogle(served, { model, originalMessages });
                 }
             }
         }
@@ -519,7 +519,7 @@ export function prepareGoogleCountTokens(
         // counted, but nothing is adopted (state is discarded here too).
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
-        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model }) };
+        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model, originalMessages: msgs }) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify(rebuilt),

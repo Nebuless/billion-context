@@ -359,7 +359,8 @@ export function normalizeGoogleUserPartOrder(
   return [...moved, ...rest];
 }
 
-const SIGNING_GEMINI_MODEL = /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i;
+const SIGNING_GEMINI_MODEL =
+  /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i;
 const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
 
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores
@@ -384,12 +385,32 @@ const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
  *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
 export function coreToGoogle(
   messages: BiliMessage[],
-  opts?: { model?: string },
+  opts?: { model?: string; originalMessages?: readonly BiliMessage[] },
 ): GoogleContent[] {
   const out: GoogleContent[] = [];
-  const modelName = opts?.model ?? "";
+  const modelName = opts?.model;
   const requiresSignature =
-    SIGNING_GEMINI_MODEL.test(modelName) && !CLAUDE_WIRE_MODEL.test(modelName);
+    typeof modelName === "string" &&
+    SIGNING_GEMINI_MODEL.test(modelName) &&
+    !CLAUDE_WIRE_MODEL.test(modelName);
+  const signedSiblings = new Set<string>();
+  if (requiresSignature && opts?.originalMessages) {
+    let signedWireIndex: number | undefined;
+    for (const m of opts.originalMessages) {
+      if (m.role !== "assistant" || m.contentType !== "tool-call") {
+        signedWireIndex = undefined;
+      } else if (m.googleThoughtSignature) {
+        signedWireIndex = m.wireIndex;
+      } else if (
+        signedWireIndex !== undefined &&
+        signedWireIndex === m.wireIndex
+      ) {
+        signedSiblings.add(m.id);
+      } else {
+        signedWireIndex = undefined;
+      }
+    }
+  }
   let model: {
     reasoning: GooglePart[];
     text: GooglePart[];
@@ -416,8 +437,18 @@ export function coreToGoogle(
       flushUser();
       if (!model) model = { reasoning: [], text: [], calls: [] };
       if (m.contentType === "reasoning") model.reasoning.push(reasoningPart(m));
-      else if (m.contentType === "tool-call") model.calls.push(toolCallPart(m));
-      else model.text.push(...contentParts(m));
+      else if (m.contentType === "tool-call") {
+        const part = toolCallPart(m);
+        // A legacy fold can promote a known parallel sibling to batch lead,
+        // even before the newest user input. Don't patch unrelated old calls.
+        model.calls.push(
+          model.calls.length === 0 &&
+            !part.thoughtSignature &&
+            signedSiblings.has(m.id)
+            ? { ...part, thoughtSignature: GOOGLE_SIGNATURE_BYPASS }
+            : part,
+        );
+      } else model.text.push(...contentParts(m));
     } else {
       flushModel();
       if (!user) user = { responses: [], content: [] };
