@@ -301,6 +301,10 @@ test("WC-027 rejects unsigned leading Gemini calls, not unsigned parallel siblin
     assert.match(issues[0], /WC-027/);
     assert.deepEqual(VALIDATORS.google(makeBody([{ ...a, thoughtSignature: "signed-head" }, b]), "gemini-4-neon"), []);
     assert.deepEqual(VALIDATORS.google(makeBody([b]), "gemini-2.5-pro"), []);
+    // Google points the -latest aliases at Gemini 3, which signs the leading call.
+    for (const alias of ["gemini-flash-latest", "models/gemini-pro-latest", "gemini-flash-lite-latest"]) {
+        assert.match(VALIDATORS.google(makeBody([b]), alias)[0] ?? "", /WC-027/);
+    }
     // A media-only user turn is a new turn boundary, like text: the prior turn's unsigned call is out of scope.
     for (const media of [
         { inlineData: { mimeType: "image/png", data: "AA==" } },

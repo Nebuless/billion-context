@@ -711,7 +711,7 @@ function validateGoogleBody(body: unknown, model?: string): string[] {
     // backend needs the OPPOSITE order (tool_result-first), which is exactly the
     // natural responses-first shape coreToGoogle emits when told the model.
     const claudeWire = typeof model === "string" && /claude/i.test(model);
-    if (model && /(?:^|\/)gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(model) && Array.isArray(body.contents)) {
+    if (model && /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i.test(model) && Array.isArray(body.contents)) {
         for (let i = body.contents.length - 1; i >= 0; i--) {
             const content = body.contents[i];
             if (!isPlainObject(content) || !Array.isArray(content.parts)) continue;

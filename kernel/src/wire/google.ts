@@ -359,7 +359,7 @@ export function normalizeGoogleUserPartOrder(
   return [...moved, ...rest];
 }
 
-const SIGNING_GEMINI_MODEL = /(?:^|\/)gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i;
+const SIGNING_GEMINI_MODEL = /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i;
 const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
 
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores

@@ -159,6 +159,12 @@ test("rebuilding an already-split Google fold repairs only the unsigned leading 
     ],
   );
   assert.equal(Object.hasOwn(unsigned, "thoughtSignature"), false);
+  // Google points the -latest aliases at Gemini 3, which signs the leading call.
+  const aliasRepaired = coreToGoogle(retained, { model: "gemini-flash-latest" });
+  assert.equal(
+    (aliasRepaired.find((content) => content.role === "model")?.parts[1] as { thoughtSignature?: string })?.thoughtSignature,
+    "skip_thought_signature_validator",
+  );
   for (const otherModel of ["gemini-2.5-pro", "claude-sonnet"]) {
     const unchanged = coreToGoogle(retained, { model: otherModel });
     assert.deepEqual(
