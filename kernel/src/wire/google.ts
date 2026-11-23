@@ -122,7 +122,7 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
         !Array.isArray(response) &&
         Object.keys(response).length === 1 &&
         typeof (response as { output?: unknown }).output === "string"
-          ? ((response as { output: string }).output)
+          ? (response as { output: string }).output
           : jsonText(response);
       const wireId = typeof fr.id === "string" ? fr.id : undefined;
       const queue = unmatchedCalls.get(fr.name);
@@ -199,10 +199,7 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
           contentType: "text",
           text: part.text,
           rawGoogleParts: [part],
-          ...signatureField(
-            "googleThoughtSignature",
-            part.thoughtSignature,
-          ),
+          ...signatureField("googleThoughtSignature", part.thoughtSignature),
         };
         msgs.push(lastTextCore);
         continue;
@@ -336,7 +333,12 @@ export function normalizeGoogleUserPartOrder(
   parts: GooglePart[],
   opts?: { model?: string },
 ): GooglePart[] {
-  if (opts && typeof opts.model === "string" && CLAUDE_WIRE_MODEL.test(opts.model)) return parts;
+  if (
+    opts &&
+    typeof opts.model === "string" &&
+    CLAUDE_WIRE_MODEL.test(opts.model)
+  )
+    return parts;
   const firstFr = parts.findIndex((p) => p.functionResponse !== undefined);
   if (firstFr === -1) return parts;
   const movable = (p: GooglePart) =>
@@ -356,6 +358,9 @@ export function normalizeGoogleUserPartOrder(
   for (const p of parts) (movable(p) ? moved : rest).push(p);
   return [...moved, ...rest];
 }
+
+const SIGNING_GEMINI_MODEL = /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i;
+const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
 
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores
  *  are merged into ONE content (Gemini rejects non-alternating roles): an
@@ -377,8 +382,14 @@ export function normalizeGoogleUserPartOrder(
  *  roles), and its output order is the canonical one. Do not reorder this
  *  emission without moving the pins in
  *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
-export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string }): GoogleContent[] {
+export function coreToGoogle(
+  messages: BiliMessage[],
+  opts?: { model?: string },
+): GoogleContent[] {
   const out: GoogleContent[] = [];
+  const modelName = opts?.model ?? "";
+  const requiresSignature =
+    SIGNING_GEMINI_MODEL.test(modelName) && !CLAUDE_WIRE_MODEL.test(modelName);
   let model: {
     reasoning: GooglePart[];
     text: GooglePart[];
@@ -417,6 +428,34 @@ export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string })
   }
   flushModel();
   flushUser();
+  if (requiresSignature) {
+    // Gemini validates the first call in each step since the latest user input.
+    // Tool results alone continue that turn; earlier turns must stay cache-stable.
+    for (let i = out.length - 1; i >= 0; i--) {
+      const content = out[i];
+      if (!content) continue;
+      if (
+        content.role === "user" &&
+        content.parts.some(
+          (part) =>
+            part.thought !== true &&
+            !part.functionResponse &&
+            (typeof part.text === "string" || part.inlineData || part.fileData),
+        )
+      ) {
+        break;
+      }
+      if (content.role !== "model") continue;
+      const index = content.parts.findIndex((part) => part.functionCall);
+      const head = content.parts[index];
+      if (head && !head.thoughtSignature) {
+        content.parts[index] = {
+          ...head,
+          thoughtSignature: GOOGLE_SIGNATURE_BYPASS,
+        };
+      }
+    }
+  }
   return out;
 }
 

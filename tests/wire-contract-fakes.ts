@@ -237,6 +237,12 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #6636 production 400 (dsh-fish-soul TTS through bili 0.1.213, Xiaomi MiMo mimo-v2.5-tts over an OpenAI-compatible /chat/completions endpoint): the plugin sends {model, messages:[user, assistant], audio:{format:"mp3",voice:"mimo_default"}, stream:false} with no tools; bili injected the FUNCTION_ACP_TAGS_TIMESTAMPED system prompt as messages[0] plus an <acp> prefix on every message, and the upstream answered 400 "messages[0] system role is not allowed for TTS model". Control experiment in the issue: the same messages undecorated return 200 with audio. Repair: isAudioOutputCall (src/server/side-request.ts) routes tool-less audio requests through the #388 verbatim side passthrough, so neither the system prompt nor the tags are ever injected. The validator keys on the `audio` field, not the model name — the shape, not the spelling, is what makes the call a TTS request.',
     },
+    {
+        id: "WC-027",
+        wire: "google",
+        summary: "Gemini 3+ requires a thought signature on the first functionCall of each tool step in the current turn; parallel siblings may be unsigned",
+        provenance: "Antigravity Cloud Code Assist returned INVALID_ARGUMENT after a fold retained an unsigned parallel sibling, ranxianglei/billion-context#6887. https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -693,7 +699,7 @@ export function validateCodexResponsesWsCreate(body: unknown): string[] {
     return out;
 }
 
-/** WC-006, WC-018 on a Gemini generateContent/streamGenerateContent body. */
+/** WC-006, WC-018, WC-027 on a Gemini generateContent/streamGenerateContent body. */
 function validateGoogleBody(body: unknown, model?: string): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -705,6 +711,21 @@ function validateGoogleBody(body: unknown, model?: string): string[] {
     // backend needs the OPPOSITE order (tool_result-first), which is exactly the
     // natural responses-first shape coreToGoogle emits when told the model.
     const claudeWire = typeof model === "string" && /claude/i.test(model);
+    if (model && /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i.test(model) && Array.isArray(body.contents)) {
+        for (let i = body.contents.length - 1; i >= 0; i--) {
+            const content = body.contents[i];
+            if (!isPlainObject(content) || !Array.isArray(content.parts)) continue;
+            if (content.role === "user" && content.parts.some((part) =>
+                isPlainObject(part) && ((typeof part.text === "string" && part.thought !== true)
+                    || isPlainObject(part.inlineData) || isPlainObject(part.fileData)),
+            )) break;
+            if (content.role !== "model") continue;
+            const call = content.parts.find((part) => isPlainObject(part) && isPlainObject(part.functionCall));
+            if (call && (typeof call.thoughtSignature !== "string" || call.thoughtSignature.length === 0)) {
+                out.push(`WC-027 contents[${i}]: first functionCall has no thought signature`);
+            }
+        }
+    }
     if (!claudeWire && Array.isArray(body.contents)) {
         body.contents.forEach((content, i) => {
             if (!isPlainObject(content) || content.role === "model") return;
@@ -749,7 +770,7 @@ function validateGoogleBody(body: unknown, model?: string): string[] {
     return out;
 }
 
-export const VALIDATORS: Record<Wire, (body: unknown) => string[]> = {
+export const VALIDATORS: Record<Wire, (body: unknown, model?: string) => string[]> = {
     anthropic: validateAnthropicBody,
     "openai-chat": validateOpenAiChatBody,
     responses: validateResponsesBody,
