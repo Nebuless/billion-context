@@ -301,6 +301,14 @@ test("WC-027 rejects unsigned leading Gemini calls, not unsigned parallel siblin
     assert.match(issues[0], /WC-027/);
     assert.deepEqual(VALIDATORS.google(makeBody([{ ...a, thoughtSignature: "signed-head" }, b]), "gemini-4-neon"), []);
     assert.deepEqual(VALIDATORS.google(makeBody([b]), "gemini-2.5-pro"), []);
+    // A media-only user turn is a new turn boundary, like text: the prior turn's unsigned call is out of scope.
+    for (const media of [
+        { inlineData: { mimeType: "image/png", data: "AA==" } },
+        { fileData: { mimeType: "application/pdf", fileUri: "gs://b/f.pdf" } },
+    ]) {
+        const body = { contents: [user, { role: "model", parts: [b] }, { role: "user", parts: [media] }] };
+        assert.deepEqual(VALIDATORS.google(body, "gemini-4-neon"), []);
+    }
 });
 
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {

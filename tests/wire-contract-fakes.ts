@@ -716,7 +716,8 @@ function validateGoogleBody(body: unknown, model?: string): string[] {
             const content = body.contents[i];
             if (!isPlainObject(content) || !Array.isArray(content.parts)) continue;
             if (content.role === "user" && content.parts.some((part) =>
-                isPlainObject(part) && typeof part.text === "string" && part.thought !== true,
+                isPlainObject(part) && ((typeof part.text === "string" && part.thought !== true)
+                    || isPlainObject(part.inlineData) || isPlainObject(part.fileData)),
             )) break;
             if (content.role !== "model") continue;
             const call = content.parts.find((part) => isPlainObject(part) && isPlainObject(part.functionCall));
