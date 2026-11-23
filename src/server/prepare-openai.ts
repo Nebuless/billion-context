@@ -205,15 +205,6 @@ export async function prepareOpenai(
             wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
             log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         }
-        // #7398 perf: the deferral gate skipped the full JSON.parse in handle.ts
-        // (150-600ms on a 155MiB resend). The lanes above only consumed the span
-        // scan + window fragments; a miss — or the gates staying closed — means
-        // the legacy path needs the whole conversation array, so parse it exactly
-        // once, here. A throw is equivalent to the legacy parse failure (same
-        // catch in handle.ts).
-        if (bodyParseDeferred && !wpOutcome?.hit && !Array.isArray(parsed.messages) && bodyText !== undefined) {
-            parsed = JSON.parse(bodyText) as OpenAIRequestBody;
-        }
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
             // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
@@ -240,6 +231,20 @@ export async function prepareOpenai(
             parsed = fields as OpenAIRequestBody;
             inboundMessageCount = wpHit.totalT;
         }
+    }
+    // #7398 perf: the deferral gate skipped the full JSON.parse in handle.ts
+    // (150-600ms on a 155MiB resend). The lanes above only consumed the span
+    // scan + window fragments; a miss — OR the lane gates staying closed (the
+    // block above never ran: non-plugin mode / watermark off / title-gen) — means
+    // the legacy path needs the whole conversation array, so parse it exactly
+    // once, here. A HIT reuses the span-scan view (wpHit set) and skips the parse
+    // (the perf win). A throw is equivalent to the legacy parse failure (same
+    // catch in handle.ts). #7576-1: this re-parse MUST sit OUTSIDE the
+    // pluginMode+!titleGen+watermark gate — the deferral in handle.ts is keyed on
+    // pf-handshake+size alone, so a non-plugin turn would otherwise keep the null
+    // messages marker and 502.
+    if (bodyParseDeferred && wpHit === undefined && !Array.isArray(parsed.messages) && bodyText !== undefined) {
+        parsed = JSON.parse(bodyText) as OpenAIRequestBody;
     }
     // Full-body text for the whole-wire image accounting (window-only bodies
     // would under-count pre-existing images).

@@ -895,7 +895,14 @@ async function handleRequest(
     // the fastpath (its bodyText !== undefined gate could never fire). Keep the text
     // only on the wire+flag slice where the fastpath can fire; the strict gate in
     // prepare-openai (pluginMode + !titleGen) remains authoritative.
-    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark"))) bodyText = undefined;
+    // #7576-1: a #7398 deferral (openai + pf handshake + ≥1MiB) synthesized `parsed`
+    // with messages=null and defers the full JSON.parse to prepareOpenai — but that
+    // re-parse is gated on pluginMode+!titleGen+watermark, so when the server is NOT
+    // in plugin mode (lane degraded / subagent proxy fallback / #4855 / watermark
+    // rolled back to 0) the text would be dropped here and the null marker would reach
+    // openaiToCore → 502 "wireMessages is not iterable". Keep the text whenever the
+    // parse was deferred so prepareOpenai can always re-parse on a miss/skip.
+    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark")) && !bodyParseDeferred) bodyText = undefined;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
