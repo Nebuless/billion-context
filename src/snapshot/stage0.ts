@@ -225,21 +225,21 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                         })();
                         if (convBound) {
                             log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — conversation-bound sid skips the R3 fault, content-derived ids this turn`);
-                        } else if (!checkR3Identity(true, msgs.length, bodyTail)) {
-                            const { latched } = r3FaultTracker.recordFault(sessionId);
-                            if (latched) {
-                                armed = false;
-                                try {
-                                    getStore()?.snapR3Latch(sessionId);
-                                } catch { /* best-effort */ }
-                                log("error", `[${sessionId}] [2x2:${lane}] R3 identity fault ×3 in window (${v.reason}) — sid latched to the legacy path (persisted)`);
-                            } else {
-                                const strike = r3FaultTracker.strikes(sessionId);
-                                log("warn", `[${sessionId}] [2x2:${lane}] R3 identity fault — strike ${strike}/${r3FaultTracker.strikeCap} in window (${v.reason}) — 400 sent; the sid latches to the legacy path after ${r3FaultTracker.strikeCap - strike} more`);
-                                throw new FoundationRejectError(`inbound msgid envelope failed validation (${v.reason})`);
-                            }
                         } else {
-                            log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
+                            // #7576-4: this whole branch is the EMPTY-ledger case
+                            // (liveIds.length === 0). A rebuilt/restored/deleted
+                            // ledger has no frontier to validate the tail form
+                            // against, so a length mismatch is a LOST LEDGER, not
+                            // a host fault. Pre-#6785 this warned and let the
+                            // turn through; #6785 routed it into the R3 breaker
+                            // (400 + strike, 3 strikes → the sid latches to the
+                            // legacy path for good). Restore the degrade:
+                            // content-derived ids this turn, and the pinMode
+                            // below (pinned === null → "full") tells the client
+                            // to resend in full form next turn so the ledger
+                            // rebuilds. The genuine-host-fault R3 path stays on
+                            // the FULL-form branch above (stage0 ~166).
+                            log("warn", `[${sessionId}] [msgid] ${lane}-wire tail form on an EMPTY ledger (${v.reason}) — no fault; content-derived ids this turn, client resends full form next turn`);
                         }
                     }
                 } else {

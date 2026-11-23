@@ -53,7 +53,7 @@ import { prepareOpenai } from "./server/prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD } from "./msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
@@ -798,7 +798,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // throws before processTurn, so the session is untouched.
             if (err instanceof FoundationRejectError) {
                 if (!res.headersSent) {
-                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity" });
+                    // #7576-5: an R3 identity fault means the client's declared
+                    // msgid envelope is broken — carry the same "resend in full
+                    // form next turn" signal the delta re-anchor 400 uses, so the
+                    // incremental-mode client re-anchors instead of re-sending the
+                    // same broken tail form and re-hitting the fault.
+                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity", [MSGID_MODE_HEADER]: "full" });
                     res.end(JSON.stringify({ error: { message: err.message, type: "snapshot_identity_fault" } }));
                 } else {
                     res.end();

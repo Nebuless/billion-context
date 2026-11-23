@@ -632,7 +632,7 @@ async function withProxyT(
 
 const PLUGIN_HEADERS = { "content-type": "application/json", "x-bili-plugin": "e2e-agent", "x-acp-session": "e2e-sess" } as Record<string, string>;
 
-test("B1: a declared host that fails to collect msgids (count mismatch) → 400 + x-bili-snapshot: identity, no upstream forward", async () => {
+test("B1: tail form on an EMPTY ledger (lost ledger) → 200 + content-derived ids + x-bili-msgid-mode: full, upstream contacted (#7576-4)", async () => {
     await withProxyT(
         () => ({ status: 200, payload: sseDone() }),
         async (url, bodies) => {
@@ -646,15 +646,16 @@ test("B1: a declared host that fails to collect msgids (count mismatch) → 400 
                         { type: "message", role: "user", content: "first" },
                         { type: "message", role: "user", content: "second" },
                     ],
-                    biliMsgIds: ["b1m1"], // 1 declared vs 2 elements — the R3 fault
+                    biliMsgIds: ["b1m1"], // 1 declared vs 2 elements — tail form on an empty ledger
                 }),
             });
-            assert.equal(res.status, 400, "the identity fault is a 400 (the B1 control channel — not the generic 503)");
-            assert.equal(res.headers.get("x-bili-snapshot"), "identity");
-            const err = JSON.parse(await res.text()) as { error: { type: string; message: string } };
-            assert.equal(err.error.type, "snapshot_identity_fault");
-            assert.ok(err.error.message.includes("R3"), "the error names the fault class");
-            assert.equal(bodies.length, 0, "zero side effects: the upstream was never contacted");
+            // #7576-4: a lost ledger (DB rebuild / backup restore / session
+            // deleted) is NOT a host fault. The server processes the turn with
+            // content-derived ids (no 400, no R3 strike) and tells the client
+            // to resend in full form next turn via x-bili-msgid-mode: full.
+            assert.equal(res.status, 200, "lost ledger → 200 (not a 400 fault)");
+            assert.equal(res.headers.get("x-bili-msgid-mode"), "full", "the client is told to resend in full form next turn");
+            assert.equal(bodies.length, 1, "the upstream IS contacted (the turn is processed normally)");
         },
         { env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1" } },
     );
@@ -747,16 +748,20 @@ test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (
     const log = (level: string, msg: string) => logs.push({ level, msg });
     try {
         assert.ok(store.snapConvBound(sid), "the conversations row makes the sid conversation-bound");
-        // a non-bound sid with the SAME fault 400s (control):
-        assert.throws(() => runStage0({
+        // #7576-4: a non-bound sid with the SAME tail form on an EMPTY ledger
+        // no longer 400s — it degrades to content-derived ids (lost ledger,
+        // not a host fault). The R3 fault path (FoundationRejectError) is
+        // now only reachable via the l1 ledger conflict (store.ts:2014).
+        const rNobound = runStage0({
             sessionId: "d2-sid-nobound",
             lane: "openai",
             msgs: dMsgs(5),
-            incomingMsgIds: ["a", "b"], // 2 ids for 6 messages
+            incomingMsgIds: ["a", "b"], // 2 ids for 6 messages — tail form on empty ledger
             incomingSeqs: null,
             pluginMode: true,
             log,
-        }), FoundationRejectError, "non-bound sid: R3 fault 400s");
+        });
+        assert.equal(rNobound.pinned, null, "non-bound sid: lost ledger → content-derived ids (no 400)");
         const r = runStage0({
             sessionId: sid,
             lane: "openai",
