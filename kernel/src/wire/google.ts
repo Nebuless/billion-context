@@ -366,6 +366,33 @@ const SIGNING_GEMINI_MODEL =
   /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i;
 const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
 
+export function googleModelRequiresThoughtSignature(model: string): boolean {
+  return SIGNING_GEMINI_MODEL.test(model) && !CLAUDE_WIRE_MODEL.test(model);
+}
+
+/** Unsigned siblings proven by a signed predecessor in the same source batch. */
+export function googleSignedBatchSiblings(
+  messages: readonly BiliMessage[],
+): Set<string> {
+  const siblings = new Set<string>();
+  let signedWireIndex: number | undefined;
+  for (const m of messages) {
+    if (m.role !== "assistant" || m.contentType !== "tool-call") {
+      signedWireIndex = undefined;
+    } else if (m.googleThoughtSignature) {
+      signedWireIndex = m.wireIndex;
+    } else if (
+      signedWireIndex !== undefined &&
+      signedWireIndex === m.wireIndex
+    ) {
+      siblings.add(m.id);
+    } else {
+      signedWireIndex = undefined;
+    }
+  }
+  return siblings;
+}
+
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores
  *  are merged into ONE content (Gemini rejects non-alternating roles): an
  *  assistant run becomes a single `{"role":"model"}` content whose parts are
@@ -394,26 +421,11 @@ export function coreToGoogle(
   const modelName = opts?.model;
   const requiresSignature =
     typeof modelName === "string" &&
-    SIGNING_GEMINI_MODEL.test(modelName) &&
-    !CLAUDE_WIRE_MODEL.test(modelName);
-  const signedSiblings = new Set<string>();
-  if (requiresSignature && opts?.originalMessages) {
-    let signedWireIndex: number | undefined;
-    for (const m of opts.originalMessages) {
-      if (m.role !== "assistant" || m.contentType !== "tool-call") {
-        signedWireIndex = undefined;
-      } else if (m.googleThoughtSignature) {
-        signedWireIndex = m.wireIndex;
-      } else if (
-        signedWireIndex !== undefined &&
-        signedWireIndex === m.wireIndex
-      ) {
-        signedSiblings.add(m.id);
-      } else {
-        signedWireIndex = undefined;
-      }
-    }
-  }
+    googleModelRequiresThoughtSignature(modelName);
+  const signedSiblings =
+    requiresSignature && opts?.originalMessages
+      ? googleSignedBatchSiblings(opts.originalMessages)
+      : undefined;
   let model: {
     reasoning: GooglePart[];
     text: GooglePart[];
@@ -448,7 +460,7 @@ export function coreToGoogle(
           model.calls.length === 0 &&
             !part.thoughtSignature &&
             requiresSignature &&
-            (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? signedSiblings.has(m.id))
+            (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? signedSiblings?.has(m.id))
             ? { ...part, thoughtSignature: GOOGLE_SIGNATURE_BYPASS }
             : part,
         );

@@ -2,7 +2,7 @@ import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { recordNudgeInject } from "../cache-ledger.js";
-import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
+import { coreToGoogle, googleToCore, googleModelRequiresThoughtSignature, googleSignedBatchSiblings, GOOGLE_SIGNED_BATCH_SIBLING, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { featureEnabled } from "../rollout.js";
@@ -185,7 +185,8 @@ export async function prepareGoogle(
         // (#651 keeps reasoning-drop off this wire — Gemini validates
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log, googleBatchEvidence: true });
+        const googleBatchEvidence = typeof model === "string" && googleModelRequiresThoughtSignature(model);
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log, googleBatchEvidence });
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -402,7 +403,17 @@ export async function prepareGoogle(
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log);
                 if (served !== null) {
-                    rebuiltContents = coreToGoogle(served, { model, originalMessages });
+                    let wireMessages = served;
+                    if (googleBatchEvidence && auth.storedCore) {
+                        const storedRows = new Set(auth.storedCore);
+                        const siblings = googleSignedBatchSiblings(auth.storedCore);
+                        // Use the objects selected by the swap, not matching
+                        // client ids. False explicitly rejects client evidence.
+                        wireMessages = served.map((m) => storedRows.has(m) && m.contentType === "tool-call"
+                            ? { ...m, [GOOGLE_SIGNED_BATCH_SIBLING]: siblings.has(m.id) }
+                            : m);
+                    }
+                    rebuiltContents = coreToGoogle(wireMessages, { model, originalMessages });
                 }
             }
         }

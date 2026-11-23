@@ -17,6 +17,7 @@
 //  7. storage unavailable: D quietly falls back to the legacy path.
 import assert from "node:assert/strict";
 import http from "node:http";
+import { Socket } from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 import { mkdtempSync } from "node:fs";
@@ -32,13 +33,14 @@ process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_STORAGE_UNIFIED = "shadow";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-snap-hermetic-")), "no-config.json");
 
-import { defaultConfig } from "acp-kernel";
+import { createCore, defaultConfig, defaultPrompts } from "acp-kernel";
 import { __setMessageIdSaltForTests, googleToCore, type GoogleContent } from "acp-kernel/wire";
 import { startServer } from "../src/server.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import { loadOptions, type ProxyOptions } from "../src/config.ts";
+import { prepareGoogle } from "../src/server/prepare-google.ts";
 import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { listSessions, _resetSessionsForTest } from "../src/session.ts";
+import { createSession, listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const SUMMARY = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK";
@@ -653,32 +655,59 @@ test("D off (default) · google: the seed-upgrade scenario churns — documents 
     }, true);
 });
 
-for (const scenario of ["reminted split batch", "mismatched client batch"] as const) {
-    test(`D on · Google uses stored signature provenance for a ${scenario}`, async () => {
+for (const scenario of ["reminted split batch", "mismatched client batch", "non-signing model", "op-log authority"] as const) {
+    test(`Google history rebuild: ${scenario}`, async (t) => {
         process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+        const authority = scenario === "op-log authority";
+        const nonSigning = scenario === "non-signing model";
+        if (authority) {
+            delete process.env.BILI_ROLLOUT_SNAPSHOT_RENDER;
+            const oldReconcile = process.env.BILI_FOLD_RECONCILE;
+            process.env.BILI_FOLD_RECONCILE = "off";
+            const old = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+            process.env.BILI_ROLLOUT_EGRESS_PLANE = "100";
+            t.after(() => {
+                if (old === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+                else process.env.BILI_ROLLOUT_EGRESS_PLANE = old;
+                if (oldReconcile === undefined) delete process.env.BILI_FOLD_RECONCILE;
+                else process.env.BILI_FOLD_RECONCILE = oldReconcile;
+            });
+        }
         await withHarness(async (h) => {
-            const model = "gemini-4-neon";
+            const model = nonSigning ? "gemini-2.5-pro" : "gemini-4-neon";
             const signed = { functionCall: { name: "lookup", id: "head", args: { key: "head" } }, thoughtSignature: "fixture-signature" };
             const unsigned = { functionCall: { name: "lookup", id: "sibling", args: { key: "sibling" } } };
             const headResponse = { functionResponse: { name: "lookup", id: "head", response: { output: "head result" } } };
             const siblingResponse = { functionResponse: { name: "lookup", id: "sibling", response: { output: "sibling result" } } };
             const before = conversation().slice(0, 9).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
             const after = [{ role: "model", parts: [{ text: "Lookup complete" }] }, { role: "user", parts: [{ text: "Next question" }] }];
-            const split = scenario === "reminted split batch";
+            const split = scenario === "reminted split batch" || nonSigning;
             const contents = (includeHead: boolean): GoogleContent[] => [
                 ...before,
                 { role: "model", parts: includeHead ? [signed, unsigned] : [unsigned] },
                 { role: "user", parts: includeHead ? [headResponse, siblingResponse] : [siblingResponse] },
                 ...after,
             ];
+            const authoritySession = authority ? createSession("google-egress-authority", { protocol: "google" }) : undefined;
+            const send = async (contents: GoogleContent[]) => {
+                if (!authoritySession) return sendGoogleContents(h, scenario, model, contents);
+                const opts = loadOptions();
+                const config = defaultConfig(100_000);
+                const body = { contents, biliMsgIds: googleToCore({ contents }).msgs.map((m) => m.id) };
+                const req = new http.IncomingMessage(new Socket());
+                req.headers["x-bili-plugin"] = "pi";
+                const prepared = await prepareGoogle(body, opts, createCore(), config, defaultPrompts, {}, () => {}, authoritySession, true, 100_000, model, true, false, h.googleUrl, req);
+                const text = String(prepared.body);
+                return { status: 200, body: text, idx: h.bodies.push(text) - 1 };
+            };
             const stored = contents(split);
-            const first = await sendGoogleContents(h, scenario, model, stored);
+            const first = await send(stored);
             assert.equal(first.status, 200, first.body);
-            const session = listSessions().find((s) => s.meta.label === scenario);
+            const session = authoritySession ?? listSessions().find((s) => s.meta.label === scenario);
             assert.ok(session);
             const storedMessages = googleToCore({ contents: stored }).msgs;
-            const coveredIds = split
-                ? storedMessages.filter((m) => m.toolCallId === "head").map((m) => m.id)
+            const coveredIds = split || authority
+                ? googleToCore({ contents: contents(true) }).msgs.filter((m) => m.toolCallId === "head").map((m) => m.id)
                 : storedMessages.slice(1, 4).map((m) => m.id);
             // Seed the fold independently of the current atomicity rules.
             session.state.blocks = [{
@@ -695,15 +724,26 @@ for (const scenario of ["reminted split batch", "mismatched client batch"] as co
                 generation: "young",
                 active: true,
             }];
-            if (split) {
+            if (scenario === "reminted split batch") {
                 __setMessageIdSaltForTests("snapshot-signature-v2");
             }
-            const second = await sendGoogleContents(h, scenario, model, [...contents(true), { role: "user", parts: [{ text: "Latest question" }] }]);
+            // This is a pre-existing fold, not a rewind of the seed turn.
+            if (authority) session.state.lastPassIds = undefined;
+            const store = getStore();
+            const read = nonSigning ? t.mock.method(store, "unifiedTailViewRows") : undefined;
+            const replay = [...contents(true), { role: "user", parts: [{ text: "Latest question" }] }];
+            const second = await send(replay);
             assert.equal(second.status, 200, second.body);
-            assertDActive(h, scenario, 1, "historical Google tool call came from the snapshot");
+            if (authority) {
+                assert.equal(session.metadata.egressAuthority, true);
+                assert.equal(session.metadata.snapshotRenderTurns, undefined);
+            } else {
+                assertDActive(h, scenario, 1, "historical Google tool call came from the snapshot");
+            }
             const outbound = JSON.parse(h.bodies[second.idx]) as { contents: GoogleContent[] };
             const tools = outbound.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
-            assert.deepEqual(tools, [split ? { ...unsigned, thoughtSignature: "skip_thought_signature_validator" } : unsigned, siblingResponse]);
+            assert.deepEqual(tools, [scenario === "reminted split batch" ? { ...unsigned, thoughtSignature: "skip_thought_signature_validator" } : unsigned, siblingResponse]);
+            if (read) assert.deepEqual(read.mock.calls.flatMap(({ arguments: [, seqs] }) => seqs ?? []), [], "non-signing models must not request covered batch evidence");
         }, true);
     });
 }

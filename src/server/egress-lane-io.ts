@@ -113,6 +113,8 @@ interface EgressAuthorityOutcome {
     /** Flow-swapped core the lane must serve, or null = the lane keeps its
      * own core. */
     swappedCore: BiliMessage[] | null;
+    /** Decoded op-log rows used as the byte source for the swap. */
+    storedCore?: BiliMessage[];
     /** The core recordAuthorityTurn writes this turn, or null = the flow is
      * NOT advanced (legacy turn, or a record-only turn whose log is
      * unreadable). */
@@ -231,7 +233,7 @@ export function resolveEgressAuthority(args: {
     const baseById = new Map(base.map((m) => [m.id, m] as const));
     const swapped = core.map((c) => baseById.get(c.id) ?? c);
     log("info", `[${sessionId}] egress-authority: ${base.length} existing row(s) served from the op-log, ${Math.max(0, core.length - base.length)} fresh from the client${base0.degraded ? ` (recovered to op_seq=${base0.seq}, truncated ${base0.truncated} row(s))` : ""}`);
-    return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: swapped, recordCore: swapped };
+    return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: swapped, recordCore: swapped, storedCore: base };
 }
 
 /** Record THIS turn per the outcome (see the ORDER MATTERS note above):
