@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { defaultConfig } from "../src/config.js";
 import { createCore } from "../src/compress.js";
+import { prune } from "../src/prune.js";
 import { assignRefs } from "../src/refs.js";
 import { createInitialState } from "../src/state.js";
 import { coreToGoogle, googleToCore } from "../src/wire/google.js";
+import { VALIDATORS } from "../../tests/wire-contract-fakes.ts";
+
+const model = "gemini-4-neon";
 
 for (const protectedTool of ["run_command", "read_file", undefined]) {
   test(`Google signed parallel calls fold atomically (protected: ${protectedTool ?? "none"})`, () => {
@@ -29,7 +33,6 @@ for (const protectedTool of ["run_command", "read_file", undefined]) {
       contents: [
         { role: "user", parts: [{ text: "older context ".repeat(80) }] },
         ...batch,
-        { role: "user", parts: [{ text: "Latest user question" }] },
       ],
     });
     const state = createInitialState();
@@ -59,12 +62,8 @@ for (const protectedTool of ["run_command", "read_file", undefined]) {
 
     assert.deepEqual(result.errors, []);
     assert.equal(result.blocksCreated, 1);
-    const covered = new Set(
-      folded.blocks.flatMap((block) => block.effectiveMessageIds),
-    );
-    const rendered = coreToGoogle(
-      messages.filter((message) => !covered.has(message.id)),
-    );
+    const rendered = coreToGoogle(prune(messages, folded), { model });
+    assert.deepEqual(VALIDATORS.google({ contents: rendered }, model), []);
     const toolContents = rendered.flatMap(({ role, parts }) => {
       const toolParts = parts.filter(
         (part) => part.functionCall || part.functionResponse,
@@ -74,3 +73,78 @@ for (const protectedTool of ["run_command", "read_file", undefined]) {
     assert.deepEqual(toolContents, protectedTool ? batch : []);
   });
 }
+
+test("rebuilding an already-split Google fold repairs only the unsigned leading call", () => {
+  const callHead = {
+    functionCall: { name: "read_file", args: {} },
+    thoughtSignature: "original-head",
+  };
+  const unsigned = {
+    functionCall: { name: "run_command", args: { command: "fixture" } },
+  };
+  const sibling = { functionCall: { name: "helper", args: {} } };
+  const later = {
+    functionCall: { name: "verify", args: {} },
+    thoughtSignature: "original-later",
+  };
+  const reply = (name: string) => ({
+    functionResponse: { name, response: { ok: true } },
+  });
+  const { msgs: messages } = googleToCore({
+    contents: [
+      { role: "user", parts: [{ text: "Run the fixture" }] },
+      { role: "model", parts: [callHead, unsigned, sibling] },
+      {
+        role: "user",
+        parts: [reply("read_file"), reply("run_command"), reply("helper")],
+      },
+      { role: "model", parts: [later] },
+      { role: "user", parts: [reply("verify")] },
+    ],
+  });
+  const ids = messages
+    .filter((m) => m.toolName === "read_file")
+    .map((m) => m.id);
+  const state = createInitialState();
+  state.blocks = [
+    {
+      blockId: "b1",
+      runId: "r1",
+      tier: 1,
+      summary: "Read the fixture",
+      directMessageIds: ids,
+      effectiveMessageIds: ids,
+      directBlockIds: [],
+      compressedTokens: 100,
+      createdAt: 1,
+      survivedCount: 0,
+      generation: "young",
+      active: true,
+    },
+  ];
+  const retained = prune(messages, state);
+
+  const rendered = coreToGoogle(retained, { model });
+
+  assert.deepEqual(VALIDATORS.google({ contents: rendered }, model), []);
+  assert.deepEqual(
+    rendered
+      .filter((content) => content.role === "model")
+      .map(({ parts }) => parts),
+    [
+      [
+        { ...unsigned, thoughtSignature: "skip_thought_signature_validator" },
+        sibling,
+      ],
+      [later],
+    ],
+  );
+  assert.equal(Object.hasOwn(unsigned, "thoughtSignature"), false);
+  for (const otherModel of ["gemini-2.5-pro", "claude-sonnet"]) {
+    const unchanged = coreToGoogle(retained, { model: otherModel });
+    assert.deepEqual(
+      unchanged.find((content) => content.role === "model")?.parts,
+      [unsigned, sibling],
+    );
+  }
+});

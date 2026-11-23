@@ -357,6 +357,9 @@ export function normalizeGoogleUserPartOrder(
   return [...moved, ...rest];
 }
 
+const SIGNING_GEMINI_MODEL = /(?:^|\/)gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i;
+const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
+
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores
  *  are merged into ONE content (Gemini rejects non-alternating roles): an
  *  assistant run becomes a single `{"role":"model"}` content whose parts are
@@ -377,8 +380,14 @@ export function normalizeGoogleUserPartOrder(
  *  roles), and its output order is the canonical one. Do not reorder this
  *  emission without moving the pins in
  *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
-export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string }): GoogleContent[] {
+export function coreToGoogle(
+  messages: BiliMessage[],
+  opts?: { model?: string },
+): GoogleContent[] {
   const out: GoogleContent[] = [];
+  const modelName = opts?.model ?? "";
+  const requiresSignature =
+    SIGNING_GEMINI_MODEL.test(modelName) && !CLAUDE_WIRE_MODEL.test(modelName);
   let model: {
     reasoning: GooglePart[];
     text: GooglePart[];
@@ -388,6 +397,23 @@ export function coreToGoogle(messages: BiliMessage[], opts?: { model?: string })
   const flushModel = () => {
     if (!model) return;
     const parts = [...model.reasoning, ...model.text, ...model.calls];
+    const head = model.calls[0];
+    // Older folds may have kept only unsigned siblings. The genuine signature
+    // belonged to the removed call; Google's documented marker is not a replay.
+    if (
+      requiresSignature &&
+      head &&
+      !parts.some(
+        (part) =>
+          typeof part.thoughtSignature === "string" &&
+          part.thoughtSignature.length > 0,
+      )
+    ) {
+      parts[model.reasoning.length + model.text.length] = {
+        ...head,
+        thoughtSignature: GOOGLE_SIGNATURE_BYPASS,
+      };
+    }
     model = null;
     if (parts.length > 0) out.push({ role: "model", parts });
   };
