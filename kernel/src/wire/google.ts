@@ -122,7 +122,7 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
         !Array.isArray(response) &&
         Object.keys(response).length === 1 &&
         typeof (response as { output?: unknown }).output === "string"
-          ? ((response as { output: string }).output)
+          ? (response as { output: string }).output
           : jsonText(response);
       const wireId = typeof fr.id === "string" ? fr.id : undefined;
       const queue = unmatchedCalls.get(fr.name);
@@ -199,10 +199,7 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
           contentType: "text",
           text: part.text,
           rawGoogleParts: [part],
-          ...signatureField(
-            "googleThoughtSignature",
-            part.thoughtSignature,
-          ),
+          ...signatureField("googleThoughtSignature", part.thoughtSignature),
         };
         msgs.push(lastTextCore);
         continue;
@@ -336,7 +333,12 @@ export function normalizeGoogleUserPartOrder(
   parts: GooglePart[],
   opts?: { model?: string },
 ): GooglePart[] {
-  if (opts && typeof opts.model === "string" && CLAUDE_WIRE_MODEL.test(opts.model)) return parts;
+  if (
+    opts &&
+    typeof opts.model === "string" &&
+    CLAUDE_WIRE_MODEL.test(opts.model)
+  )
+    return parts;
   const firstFr = parts.findIndex((p) => p.functionResponse !== undefined);
   if (firstFr === -1) return parts;
   const movable = (p: GooglePart) =>
@@ -397,23 +399,6 @@ export function coreToGoogle(
   const flushModel = () => {
     if (!model) return;
     const parts = [...model.reasoning, ...model.text, ...model.calls];
-    const head = model.calls[0];
-    // Older folds may have kept only unsigned siblings. The genuine signature
-    // belonged to the removed call; Google's documented marker is not a replay.
-    if (
-      requiresSignature &&
-      head &&
-      !parts.some(
-        (part) =>
-          typeof part.thoughtSignature === "string" &&
-          part.thoughtSignature.length > 0,
-      )
-    ) {
-      parts[model.reasoning.length + model.text.length] = {
-        ...head,
-        thoughtSignature: GOOGLE_SIGNATURE_BYPASS,
-      };
-    }
     model = null;
     if (parts.length > 0) out.push({ role: "model", parts });
   };
@@ -443,6 +428,34 @@ export function coreToGoogle(
   }
   flushModel();
   flushUser();
+  if (requiresSignature) {
+    // Gemini validates the first call in each step since the latest user input.
+    // Tool results alone continue that turn; earlier turns must stay cache-stable.
+    for (let i = out.length - 1; i >= 0; i--) {
+      const content = out[i];
+      if (!content) continue;
+      if (
+        content.role === "user" &&
+        content.parts.some(
+          (part) =>
+            part.thought !== true &&
+            !part.functionResponse &&
+            (typeof part.text === "string" || part.inlineData || part.fileData),
+        )
+      ) {
+        break;
+      }
+      if (content.role !== "model") continue;
+      const index = content.parts.findIndex((part) => part.functionCall);
+      const head = content.parts[index];
+      if (head && !head.thoughtSignature) {
+        content.parts[index] = {
+          ...head,
+          thoughtSignature: GOOGLE_SIGNATURE_BYPASS,
+        };
+      }
+    }
+  }
   return out;
 }
 
