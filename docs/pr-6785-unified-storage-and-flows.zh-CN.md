@@ -359,7 +359,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 对 `metadata.egressAuthority === true`(且 `egressPlane` 开)的会话:
 
 - **不再逐轮统一 ingest**:`ingestRowsNow` 与防抖统一腿早退——这些会话的 `messages` 表降级为**惰性投影**(平面回滚 / web 读 / 副本恢复时一次性 O(n) 重建)。重启后的引导仍走 op log(`recoverEgressBase`),不走投影。
-- **pin 通道读 op log**:KDD #21/#21 pin 账本(尾重叠 / 活 id 重盖)在 egress-on 会话上改从 `egress_flow` I 行(msgid + log_seq)解析,不经 messages 账本(`snapPinLiveIds` shim)。wire 不变。
+- **pin 通道读 op log**:KDD #21/#22 pin 账本(尾重叠 / 活 id 重盖)在 egress-on 会话上改从 `egress_flow` I 行(msgid + log_seq)解析,不经 messages 账本(`snapPinLiveIds` shim)。wire 不变。
 - **信封在 bootstrap 冻结**(`d28d9ff3a`):不再逐轮读+写 15.5MB 的会话 JSON(kernel refs 永不裁剪——10w 时 messageRefs 10MB + tsStamps 5.5MB);冻结路由必须保持常驻字段不被裁剪(`9183ea817`,#4788 D2),否则 pinned 轮 502。
 - **校验**:egress 探针(flow vs 客户端抽样)是 egress-on 会话唯一的漂移校验器——`BatchedViewVerification` 对它们关闭(`13b9baae2`):客户端 vs 正史那条腿只会量到已知的服务端赢分歧(裁定 7439-5),并把 drift 永远锁死。
 - flow 损坏语义:硬失败,出站无投影兜底——flow 与 messages 同生共死(flow 独立性,裁定 7439-2 §2)。

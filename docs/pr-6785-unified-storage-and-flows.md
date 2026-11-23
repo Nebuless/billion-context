@@ -357,7 +357,7 @@ Fix: `planIngestReanchor` + the `ingestSession` re-anchor txn branch. Per window
 For sessions with `metadata.egressAuthority === true` (and `egressPlane` on):
 
 - **No per-turn unified ingest**: `ingestRowsNow` and the debounced unified legs early-return — the `messages` table is demoted to a **lazy projection** for these sessions (rebuilt one-time O(n) on plane rollback / web read / replica restore). Boot after restart still comes from the op log (`recoverEgressBase`), not from the projection.
-- **Pin channel reads the op log**: the KDD #21/#21 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
+- **Pin channel reads the op log**: the KDD #21/#22 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
 - **Envelope frozen at bootstrap** (`d28d9ff3a`): no per-turn read+rewrite of the 15.5MB growing session JSON (kernel refs are never pruned — messageRefs 10MB + tsStamps 5.5MB at 100k); the frozen route must keep the resident fields unthinned (`9183ea817`, #4788 D2) or the pinned turn 502s.
 - **Verification**: the egress probe (flow vs client sample) is the SOLE drift verifier for egress-on sessions — `BatchedViewVerification` is off for them (`13b9baae2`): the client-vs-canonical leg would only measure the known server-wins divergence (ruling 7439-5) and re-latch drift forever.
 - Flow-corruption semantics: HARD FAIL, no projection fallback for outbound — flow and messages die together anyway (flow independence, ruling 7439-2 §2).
