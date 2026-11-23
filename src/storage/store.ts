@@ -4058,16 +4058,16 @@ export class UnifiedStore {
         }
     }
 
-    /** #D5-5 render windowing: identity-only rows (seq + msg_id) — no
-     *  content bytes, no media hydration. The render lane needs every row's
+    /** #D5-5 render windowing: row metadata only — no content bytes or
+     *  media hydration. The render lane needs every row's
      *  POSITION and id (block anchoring, seam chain byId), but covered rows'
      *  BYTES never ride the outbound — loading them per request is pure read
      *  amplification on big folded sessions. */
-    messageIdRows(sessionId: string): { seq: number; msgId: string; ts: number | null }[] {
+    messageIdRows(sessionId: string): { seq: number; msgId: string; ts: number | null; kind: string }[] {
         const rows = this.db
-            .prepare("SELECT seq, msg_id, ts FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
+            .prepare("SELECT seq, msg_id, ts, kind FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
             .all(sessionId) as Record<string, unknown>[];
-        return rows.map((r) => ({ seq: r.seq as number, msgId: r.msg_id as string, ts: (r.ts as number | null) ?? null }));
+        return rows.map((r) => ({ seq: r.seq as number, msgId: r.msg_id as string, ts: (r.ts as number | null) ?? null, kind: r.kind as string }));
     }
 
     /** #D5-5 render windowing: full rows (content + media) ONLY for seqs

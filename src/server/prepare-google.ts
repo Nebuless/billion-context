@@ -185,7 +185,7 @@ export async function prepareGoogle(
         // (#651 keeps reasoning-drop off this wire — Gemini validates
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log, googleBatchEvidence: true });
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.

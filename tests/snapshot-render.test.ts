@@ -33,7 +33,7 @@ process.env.BILI_STORAGE_UNIFIED = "shadow";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-snap-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
-import { __setMessageIdSaltForTests } from "acp-kernel/wire";
+import { __setMessageIdSaltForTests, googleToCore, type GoogleContent } from "acp-kernel/wire";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
@@ -530,18 +530,23 @@ type GPart = { text?: unknown; thought?: boolean };
 type GContent = { role: string; parts: GPart[] };
 
 async function turnGoogle(h: Harness, label: string, messages: Msg[], history: Msg[] | null = null): Promise<{ status: number; body: string; idx: number }> {
-    const r = await fetch(h.googleUrl, {
+    const turn = await sendGoogleContents(h, label, "gemini-test", messages.map((m) => ({ role: m.role, parts: [{ text: m.content }] })));
+    if (history) for (const m of extractAssistantGoogle(turn.body)) history.push(m);
+    return turn;
+}
+
+async function sendGoogleContents(h: Harness, label: string, model: string, contents: GoogleContent[]): Promise<{ status: number; body: string; idx: number }> {
+    const r = await fetch(h.googleUrl.replace("/models/gemini-test:", `/models/${model}:`), {
         method: "POST",
         headers: { "content-type": "application/json", "x-acp-session": label },
         body: JSON.stringify({
-            model: "gemini-test",
-            contents: messages.map((m) => ({ role: m.role, parts: [{ text: m.content }] })),
+            model,
+            contents,
             generationConfig: { maxOutputTokens: 4096 },
         }),
     });
     const body = await r.text();
     await settleRows(h, label); // same anti-flake discipline as the openai turn(): rows must LAND before the next D view build
-    if (history) for (const m of extractAssistantGoogle(body)) history.push(m);
     return { status: r.status ?? 0, body, idx: h.bodies.length - 1 };
 }
 
@@ -647,6 +652,61 @@ test("D off (default) · google: the seed-upgrade scenario churns — documents 
         assert.equal(h.sessionOf("g-legacy")!.metadata["snapshotRenderTurns"], undefined, "no D latch");
     }, true);
 });
+
+for (const scenario of ["reminted split batch", "mismatched client batch"] as const) {
+    test(`D on · Google uses stored signature provenance for a ${scenario}`, async () => {
+        process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+        await withHarness(async (h) => {
+            const model = "gemini-4-neon";
+            const signed = { functionCall: { name: "lookup", id: "head", args: { key: "head" } }, thoughtSignature: "fixture-signature" };
+            const unsigned = { functionCall: { name: "lookup", id: "sibling", args: { key: "sibling" } } };
+            const headResponse = { functionResponse: { name: "lookup", id: "head", response: { output: "head result" } } };
+            const siblingResponse = { functionResponse: { name: "lookup", id: "sibling", response: { output: "sibling result" } } };
+            const before = conversation().slice(0, 9).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+            const after = [{ role: "model", parts: [{ text: "Lookup complete" }] }, { role: "user", parts: [{ text: "Next question" }] }];
+            const split = scenario === "reminted split batch";
+            const contents = (includeHead: boolean): GoogleContent[] => [
+                ...before,
+                { role: "model", parts: includeHead ? [signed, unsigned] : [unsigned] },
+                { role: "user", parts: includeHead ? [headResponse, siblingResponse] : [siblingResponse] },
+                ...after,
+            ];
+            const stored = contents(split);
+            const first = await sendGoogleContents(h, scenario, model, stored);
+            assert.equal(first.status, 200, first.body);
+            const session = listSessions().find((s) => s.meta.label === scenario);
+            assert.ok(session);
+            const storedMessages = googleToCore({ contents: stored }).msgs;
+            const coveredIds = split
+                ? storedMessages.filter((m) => m.toolCallId === "head").map((m) => m.id)
+                : storedMessages.slice(1, 4).map((m) => m.id);
+            // Seed the fold independently of the current atomicity rules.
+            session.state.blocks = [{
+                blockId: "b_legacy_signature",
+                runId: "r_legacy_signature",
+                tier: 1,
+                summary: SUMMARY,
+                directMessageIds: coveredIds,
+                effectiveMessageIds: coveredIds,
+                directBlockIds: [],
+                compressedTokens: 100,
+                createdAt: 1,
+                survivedCount: 0,
+                generation: "young",
+                active: true,
+            }];
+            if (split) {
+                __setMessageIdSaltForTests("snapshot-signature-v2");
+            }
+            const second = await sendGoogleContents(h, scenario, model, [...contents(true), { role: "user", parts: [{ text: "Latest question" }] }]);
+            assert.equal(second.status, 200, second.body);
+            assertDActive(h, scenario, 1, "historical Google tool call came from the snapshot");
+            const outbound = JSON.parse(h.bodies[second.idx]) as { contents: GoogleContent[] };
+            const tools = outbound.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
+            assert.deepEqual(tools, [split ? { ...unsigned, thoughtSignature: "skip_thought_signature_validator" } : unsigned, siblingResponse]);
+        }, true);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // #3812 stakes: the identity signature has no id component, so repeated short

@@ -1,5 +1,5 @@
 import type * as http from "node:http";
-import type { BiliMessage } from "acp-kernel/wire";
+import { GOOGLE_SIGNED_BATCH_SIBLING, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
 import { listSessions, type Session } from "../session.js";
@@ -106,9 +106,9 @@ export function identitySigForTest(m: BiliMessage): string {
 interface ViewRow {
     seq: number;
     msgId: string;
-    /** Present only for UNCOVERED rows — covered rows' bytes never ride the
-     *  outbound (suppressed behind anchors), so the windowed loader (#D5-5)
-     * never reads them. */
+    kind: string;
+    /** Loaded for uncovered rows by the windowed loader (#D5-5). Covered
+     *  Google call evidence is kept separately and never rides outbound. */
     msg?: BiliMessage;
 }
 
@@ -123,6 +123,7 @@ interface SnapshotRenderDeps {
      *  channel). This bypass only means the D-lane render below never runs;
      *  the egress plane is a different surface. */
     pluginMode?: boolean;
+    googleBatchEvidence?: boolean;
     log?: (level: string, msg: string) => void;
 }
 
@@ -167,15 +168,15 @@ function parseRow(content: string, seq: number, ts?: number | null): BiliMessage
 
 /**
  * Returns the merged view, or `clientMsgs` unchanged when the lane is
- * inactive/degraded. Pure with respect to the transcript: the only mutations
- * are two observability fields on `session.metadata` (the render latch and the
- * last post-arm degrade reason) — neither touches outbound bytes.
+ * inactive/degraded. The transcript is read-only; batch evidence only marks
+ * request-local row objects, and render observability lives on the session.
  */
 // tailStart (#4241): the first CLIENT index of the live tail (clientJoin) —
 // everything in clientMsgs at indices >= tailStart rides the outbound verbatim,
 // everything below is server-rendered territory. Exposed so the egress judge can
 // exempt the rendered prefix and validate only the tail it promises byte-intact.
 type ViewResult = { ok: true; view: BiliMessage[]; tailStart: number } | { ok: false; reason: string };
+type SnapshotViewResult = ViewResult & ({ ok: false } | { prefixRows: ViewRow[]; coveredSeqs: Set<number> });
 
 interface TranscriptBase {
     rows: ViewRow[];
@@ -202,7 +203,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         const seqs = store.unifiedTailSeqs(session.id);
         if (!light || light.length === 0 || !seqs || seqs.length === 0) return { reason: "transcript-empty" };
         bySeq = new Map<number, ViewRow>();
-        for (const row of light) bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId });
+        for (const row of light) bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, kind: row.kind });
         for (const seq of seqs) {
             const v = bySeq.get(seq);
             if (!v) return { reason: "view-pointer-missing-row" }; // view pointer to a missing row: degrade
@@ -262,7 +263,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
             for (const row of contentRows) {
                 const msg = parseRow(row.content, row.seq, row.ts);
                 if (!msg) return { reason: "row-unparsable" }; // uncovered bytes are untrustworthy: degrade, never guess
-                bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, msg });
+                bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, kind: row.kind, msg });
             }
             let coveredSeen = 0;
             for (const r of rows) {
@@ -340,7 +341,7 @@ function assembleView(rows: ViewRow[], blockSeeds: { blockId: string; seqs: Set<
     return merged;
 }
 
-function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
+function buildView(session: Session, clientMsgs: BiliMessage[]): SnapshotViewResult {
     const activeBlocks = session.state.blocks.filter((b) => b.active);
     if (activeBlocks.length === 0) return { ok: false, reason: "no-active-blocks" };
     const base = loadTranscriptBase(session);
@@ -444,7 +445,48 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     // the judge would validate nothing (vacuous clean — the regression that
     // blinded the #4241 teeth on the T1-consolidation train).
     const tailCount = clientMsgs.length - clientJoin;
-    return { ok: true, view: merged, tailStart: merged.length - tailCount };
+    return { ok: true, view: merged, tailStart: merged.length - tailCount, prefixRows: rows.slice(0, d), coveredSeqs: coveredSeqUnion };
+}
+
+/** Prove parallel membership in the selected stored prefix, never by joining
+ *  against a client id. Only covered tool-call runs immediately preceding a
+ *  visible unsigned call need their bodies read. A missing row breaks proof. */
+function markGoogleSnapshotBatches(sessionId: string, rows: readonly ViewRow[], coveredSeqs: ReadonlySet<number>): void {
+    const needed: number[] = [];
+    let pending: number[] = [];
+    for (const row of rows) {
+        if (coveredSeqs.has(row.seq) && row.kind === "tool-call") {
+            if (!row.msg) pending.push(row.seq);
+            continue;
+        }
+        if (row.msg?.role === "assistant" && row.msg.contentType === "tool-call" &&
+            row.msg.wireIndex !== undefined && !row.msg.googleThoughtSignature) {
+            for (const seq of pending) needed.push(seq);
+        }
+        pending = [];
+    }
+    const store = getStore();
+    const loaded = new Map<number, BiliMessage>();
+    for (let offset = 0; offset < needed.length; offset += 500) {
+        for (const row of store.unifiedTailViewRows(sessionId, needed.slice(offset, offset + 500)) ?? []) {
+            const msg = parseRow(row.content, row.seq);
+            if (msg && msg.id === row.msgId) loaded.set(row.seq, msg);
+        }
+    }
+    let signedWireIndex: number | undefined;
+    for (const row of rows) {
+        const m = row.msg ?? loaded.get(row.seq);
+        if (m?.role !== "assistant" || m.contentType !== "tool-call") {
+            signedWireIndex = undefined;
+            continue;
+        }
+        const rowMatches = m.id === row.msgId;
+        const sibling = rowMatches && !m.googleThoughtSignature && signedWireIndex !== undefined && signedWireIndex === m.wireIndex;
+        if (!coveredSeqs.has(row.seq)) m[GOOGLE_SIGNED_BATCH_SIBLING] = sibling;
+        if (!rowMatches) signedWireIndex = undefined;
+        else if (m.googleThoughtSignature) signedWireIndex = m.wireIndex;
+        else if (!sibling) signedWireIndex = undefined;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +577,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     const r = buildView(session, clientMsgs);
     if (live) {
         if (!r.ok) return legacyFor(session, deps, clientMsgs, r.reason);
+        if (deps.googleBatchEvidence) markGoogleSnapshotBatches(session.id, r.prefixRows, r.coveredSeqs);
         delete session.metadata["snapshotRenderDegradeReason"];
         session.metadata["snapshotRenderTailStart"] = r.tailStart;
         noteRender(session, deps);

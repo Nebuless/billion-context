@@ -2594,12 +2594,13 @@ export class SessionStore {
 
     /** #3756 snapshot render: full-identity row view of the unified
      *  transcript (msgId/ref/refNum/contentHash included) in seq order.
+     *  A bounded seq list reads only those rows for Google batch evidence.
      *  Null when the unified store is unavailable — the render lane must
      *  degrade to the legacy path, never guess. */
-    unifiedTailViewRows(sessionId: string): import("./storage/store.js").MessageRow[] | null {
+    unifiedTailViewRows(sessionId: string, seqs?: readonly number[]): import("./storage/store.js").MessageRow[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
-            return this.shadow.tailViewRows(sessionId);
+            return this.shadow.tailViewRows(sessionId, seqs);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
         }
@@ -2633,10 +2634,10 @@ export class SessionStore {
         }
     }
 
-    /** #D5-5 render windowing: identity-only rows (seq + msg_id). Null when
+    /** #D5-5 render windowing: row metadata with no content bytes. Null when
      *  the unified store is unavailable — the render lane degrades, never
      *  guesses. */
-    unifiedMessageIdRows(sessionId: string): { seq: number; msgId: string }[] | null {
+    unifiedMessageIdRows(sessionId: string): { seq: number; msgId: string; kind: string }[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.messageIdRows(sessionId);

@@ -6,7 +6,10 @@ import {
   deriveCanonicalMessageId,
   imageMediaFingerprint,
 } from "./identity.js";
-import type { BiliMessage } from "./bili-message.js";
+import {
+  GOOGLE_SIGNED_BATCH_SIBLING,
+  type BiliMessage,
+} from "./bili-message.js";
 
 // Gemini native wire (`generativelanguage.googleapis.com`, /v1beta/models/<m>:
 // generateContent|streamGenerateContent|countTokens). Two properties of this
@@ -444,7 +447,8 @@ export function coreToGoogle(
         model.calls.push(
           model.calls.length === 0 &&
             !part.thoughtSignature &&
-            signedSiblings.has(m.id)
+            requiresSignature &&
+            (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? signedSiblings.has(m.id))
             ? { ...part, thoughtSignature: GOOGLE_SIGNATURE_BYPASS }
             : part,
         );
