@@ -291,6 +291,18 @@ test("WC-018 validates user-side part order on the Google wire (plain text befor
     }), []);
 });
 
+test("WC-027 rejects unsigned leading Gemini calls, not unsigned parallel siblings", () => {
+    const a = { functionCall: { name: "a", args: {} } };
+    const b = { functionCall: { name: "b", args: {} } };
+    const user = { role: "user", parts: [{ text: "Run both tools" }] };
+    const makeBody = (parts: unknown[]) => ({ contents: [user, { role: "model", parts }] });
+    const issues = VALIDATORS.google(makeBody([b]), "gemini-4-neon");
+    assert.equal(issues.length, 1);
+    assert.match(issues[0], /WC-027/);
+    assert.deepEqual(VALIDATORS.google(makeBody([{ ...a, thoughtSignature: "signed-head" }, b]), "gemini-4-neon"), []);
+    assert.deepEqual(VALIDATORS.google(makeBody([b]), "gemini-2.5-pro"), []);
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -375,12 +387,14 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ functionDeclarations: [{ name: "ok", parameters: { anyOf: [] } }] }] },
             // WC-018: the #3159 shape — plain text after a functionResponse part.
             { contents: [{ role: "user", parts: [{ functionResponse: { name: "add", response: {} } }, { text: "nudge" }] }] },
+            { contents: [{ role: "model", parts: [{ functionCall: { name: "tool" } }] }] },
         ],
     };
     for (const rule of WIRE_RULES) {
         if (rule.lane) continue; // lane-scoped rules are gated by their own lane's fake — see the lane probe gate below
         const enforced = probes[rule.wire].some((body) =>
-            VALIDATORS[rule.wire](body).some((v) => v.startsWith(rule.id)),
+            VALIDATORS[rule.wire](body, rule.wire === "google" ? "gemini-4-neon" : undefined)
+                .some((v) => v.startsWith(rule.id)),
         );
         assert.ok(enforced, `rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }

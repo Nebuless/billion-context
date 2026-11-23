@@ -1,4 +1,5 @@
 import type { CoreMessage } from "./types.js";
+import type { BiliMessage } from "./wire/bili-message.js";
 
 function isAssistantAct(msg: CoreMessage): boolean {
   return (
@@ -130,17 +131,24 @@ export interface IntegrityPre {
   callIdByMessageId: Map<string, string>;
   resultIdByCallId: Map<string, string>;
   groups: string[][];
+  signedGoogleBatches: string[][];
 }
 
 /** One-pass build of {@link IntegrityPre} for a message array. */
-export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
+export function buildIntegrityPre(messages: BiliMessage[]): IntegrityPre {
   const reasoningIds = new Set<string>();
   const callIds = new Set<string>();
   const callMessages: CoreMessage[] = [];
   const callIdByMessageId = new Map<string, string>();
   const resultIdByCallId = new Map<string, string>();
+  const signedGoogleBatches: string[][] = [];
+  let googleBatch:
+    { wireIndex: number | undefined; calls: string[] } | undefined;
   for (const m of messages) {
-    if (!m.id) continue;
+    if (!m.id) {
+      googleBatch = undefined;
+      continue;
+    }
     if (m.contentType === "reasoning") reasoningIds.add(m.id);
     if (m.role === "assistant" && m.contentType === "tool-call") {
       callIds.add(m.id);
@@ -148,6 +156,17 @@ export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
       if (typeof m.toolCallId === "string") {
         callIdByMessageId.set(m.id, m.toolCallId);
       }
+      if (m.googleThoughtSignature) {
+        const calls = [m.id];
+        googleBatch = { wireIndex: m.wireIndex, calls };
+        signedGoogleBatches.push(calls);
+      } else if (googleBatch && googleBatch.wireIndex === m.wireIndex) {
+        googleBatch.calls.push(m.id);
+      } else {
+        googleBatch = undefined;
+      }
+    } else {
+      googleBatch = undefined;
     }
     if (m.contentType === "tool-result" && typeof m.toolCallId === "string") {
       if (!resultIdByCallId.has(m.toolCallId)) {
@@ -162,6 +181,9 @@ export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
     callIdByMessageId,
     resultIdByCallId,
     groups: computeTurnGroups(messages),
+    signedGoogleBatches: signedGoogleBatches.filter(
+      (calls) => calls.length > 1,
+    ),
   };
 }
 
@@ -174,8 +196,10 @@ export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
  *     withdrawn wholesale (all members stay visible).
  *   - INV2 — a tool-call and its tool-result are one exchange: a pair the fold
  *     would split is withdrawn together.
+ *   - INV3 — Gemini signs only the leading call in a parallel batch. The
+ *     batch and its results fold together or stay visible together.
  *
- * The two invariants feed each other. Withdrawing a call for INV2 leaves a turn
+ * The invariants feed each other. Withdrawing a call for INV2 leaves a turn
  * whose reasoning still folds while its call now stays visible — exactly the
  * INV1 split — and withdrawing a turn for INV1 can strand a result whose call
  * survived outside the turn. One pass in a fixed order misses both, so the gate
@@ -205,6 +229,7 @@ export function computeIntegrityWithdrawals(
   const withdrawn = new Set<string>();
   const handledTurns = new Set<number>();
   const handledPairs = new Set<string>();
+  const handledGoogleBatches = new Set<string[]>();
 
   const built = pre ?? buildIntegrityPre(messages);
   const reasoningIds = built.reasoningIds;
@@ -224,16 +249,33 @@ export function computeIntegrityWithdrawals(
       );
       if (!foldHasReasoning) continue;
       const keptHasCall = group.some(
-        (id) =>
-          !remaining.has(id) &&
-          callIds.has(id) &&
-          !invisibleIds?.has(id),
+        (id) => !remaining.has(id) && callIds.has(id) && !invisibleIds?.has(id),
       );
       if (!keptHasCall) continue;
       handledTurns.add(g);
       for (const id of group) {
         remaining.delete(id);
         withdrawn.add(id);
+      }
+      changed = true;
+    }
+
+    for (const batch of built.signedGoogleBatches) {
+      if (handledGoogleBatches.has(batch)) continue;
+      if (!batch.some((id) => remaining.has(id))) continue;
+      if (!batch.some((id) => !remaining.has(id) && !invisibleIds?.has(id)))
+        continue;
+      handledGoogleBatches.add(batch);
+      for (const id of batch) {
+        remaining.delete(id);
+        withdrawn.add(id);
+        const callId = callIdByMessageId.get(id);
+        const resultId =
+          callId === undefined ? undefined : resultIdByCallId.get(callId);
+        if (resultId !== undefined) {
+          remaining.delete(resultId);
+          withdrawn.add(resultId);
+        }
       }
       changed = true;
     }
@@ -255,7 +297,7 @@ export function computeIntegrityWithdrawals(
 
   return {
     withdrawn,
-    splitTurnCount: handledTurns.size,
+    splitTurnCount: handledTurns.size + handledGoogleBatches.size,
     splitPairCount: handledPairs.size,
   };
 }
