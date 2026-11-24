@@ -160,9 +160,12 @@ test("rebuilding an already-split Google fold repairs only the unsigned leading 
   );
   assert.equal(Object.hasOwn(unsigned, "thoughtSignature"), false);
   // Google points the -latest aliases at Gemini 3, which signs the leading call.
-  const aliasRepaired = coreToGoogle(retained, { model: "gemini-flash-latest" });
+  const aliasRepaired = coreToGoogle(retained, {
+    model: "gemini-flash-latest",
+  });
   assert.equal(
-    (aliasRepaired.find((content) => content.role === "model")?.parts[1] as { thoughtSignature?: string })?.thoughtSignature,
+    aliasRepaired.find((content) => content.role === "model")?.parts[1]
+      ?.thoughtSignature,
     "skip_thought_signature_validator",
   );
   for (const otherModel of ["gemini-2.5-pro", "claude-sonnet"]) {
@@ -172,6 +175,77 @@ test("rebuilding an already-split Google fold repairs only the unsigned leading 
       [reasoning, unsigned, sibling, signedSibling],
     );
   }
+});
+
+test("a split Google batch is repaired even after a new user turn", () => {
+  const calls = ["head", "first", "second", "third"].map((id) => ({
+    functionCall: { name: "lookup", id, args: { key: id } },
+  }));
+  const [head, first, ...rest] = calls;
+  assert.ok(head && first);
+  const nextStep = {
+    functionCall: { name: "finish", id: "done", args: {} },
+    thoughtSignature: "signed-next-step",
+  };
+  const responses = [...calls, nextStep].map(
+    ({ functionCall: { name, id } }) => ({
+      functionResponse: { name, id, response: { ok: true } },
+    }),
+  );
+  const { msgs: originalMessages } = googleToCore({
+    contents: [
+      { role: "user", parts: [{ text: "Check the fixtures" }] },
+      {
+        role: "model",
+        parts: [{ ...head, thoughtSignature: "signed-head" }, first, ...rest],
+      },
+      { role: "user", parts: responses.slice(0, 4) },
+      { role: "model", parts: [{ text: "Checking complete" }, nextStep] },
+      { role: "user", parts: responses.slice(4) },
+      { role: "user", parts: [{ text: "Next task" }] },
+    ],
+  });
+  const ids = originalMessages
+    .filter((m) => m.toolCallId === "head")
+    .map((m) => m.id);
+  const state = createInitialState();
+  state.blocks = [
+    {
+      blockId: "b1",
+      runId: "r1",
+      tier: 1,
+      summary: "Looked up the first fixture",
+      directMessageIds: ids,
+      effectiveMessageIds: ids,
+      directBlockIds: [],
+      compressedTokens: 100,
+      createdAt: 1,
+      survivedCount: 0,
+      generation: "young",
+      active: true,
+    },
+  ];
+
+  const rendered = coreToGoogle(prune(originalMessages, state), {
+    model,
+    originalMessages,
+  });
+
+  assert.deepEqual(
+    rendered.filter((c) => c.role === "model").map((c) => c.parts),
+    [
+      [
+        { ...first, thoughtSignature: "skip_thought_signature_validator" },
+        ...rest,
+      ],
+      [{ text: "Checking complete" }, nextStep],
+    ],
+  );
+  assert.deepEqual(
+    rendered.flatMap((c) => c.parts.filter((p) => p.functionResponse)),
+    responses.slice(1),
+  );
+  assert.equal(Object.hasOwn(first, "thoughtSignature"), false);
 });
 
 test("rebuilding a completed Google turn preserves unsigned call bytes", () => {
@@ -188,7 +262,7 @@ test("rebuilding a completed Google turn preserves unsigned call bytes", () => {
     contents: [...previous, { role: "user", parts: [{ text: "Next task" }] }],
   });
 
-  const rendered = coreToGoogle(msgs, { model });
+  const rendered = coreToGoogle(msgs, { model, originalMessages: msgs });
 
   assert.deepEqual(VALIDATORS.google({ contents: rendered }, model), []);
   assert.equal(

@@ -2,7 +2,7 @@ import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { recordNudgeInject } from "../cache-ledger.js";
-import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
+import { coreToGoogle, googleToCore, googleModelRequiresThoughtSignature, googleSignedBatchSiblings, GOOGLE_SIGNED_BATCH_SIBLING, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { featureEnabled } from "../rollout.js";
@@ -44,6 +44,37 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { rebuildCoreFromLog } from "../storage/egress-serve.js";
+
+type GoogleEgressMessage = BiliMessage & { readonly egressGoogleSignedBatchSibling?: true };
+
+/**
+ * Attach persisted signed-batch proof to every Google tool-call row written to the op log.
+ * Stored proof is never downgraded. Rows served from the log (identity members of
+ * `stored`) take their proof only from the log, so the render-only symbol rejects
+ * client evidence for them; fresh client rows keep the client's batch evidence.
+ */
+function withGoogleBatchProvenance(
+    rows: readonly GoogleEgressMessage[],
+    stored: readonly GoogleEgressMessage[],
+    clientSiblings: ReadonlySet<string>,
+): GoogleEgressMessage[] {
+    const storedRows = new Set(stored);
+    const storedProof = googleSignedBatchSiblings(stored);
+    for (const m of stored) if (m.egressGoogleSignedBatchSibling === true) storedProof.add(m.id);
+    return rows.map((m) => {
+        if (m.contentType !== "tool-call") return m;
+        const proven = storedProof.has(m.id);
+        if (storedRows.has(m)) {
+            return proven
+                ? { ...m, egressGoogleSignedBatchSibling: true, [GOOGLE_SIGNED_BATCH_SIBLING]: true }
+                : { ...m, [GOOGLE_SIGNED_BATCH_SIBLING]: false };
+        }
+        return proven || (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? clientSiblings.has(m.id))
+            ? { ...m, egressGoogleSignedBatchSibling: true }
+            : m;
+    });
+}
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -185,7 +216,8 @@ export async function prepareGoogle(
         // (#651 keeps reasoning-drop off this wire — Gemini validates
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        const googleBatchEvidence = typeof model === "string" && googleModelRequiresThoughtSignature(model);
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log, googleBatchEvidence });
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -357,7 +389,7 @@ export async function prepareGoogle(
         // system is assembled below, so the recorded system row is the
         // lane's OUTBOUND system.
         const laneCoreForRecord = egressMessages;
-        rebuiltContents = coreToGoogle(egressMessages, { model });
+        rebuiltContents = coreToGoogle(egressMessages, { model, originalMessages });
 
         // ONLY the static compress prompt joins the client's system text — the
         // system instruction is the prefix-cache anchor and must stay
@@ -400,9 +432,17 @@ export async function prepareGoogle(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
+                if (auth.recordCore?.some((m) => m.contentType === "tool-call")) {
+                    // One write path for every op-log turn (bootstrap, swap, record-only):
+                    // persist batch proof before compaction drops the signed predecessor.
+                    const stored = auth.storedCore ?? rebuildCoreFromLog(auth.base) ?? [];
+                    const annotated = withGoogleBatchProvenance(auth.recordCore, stored, googleSignedBatchSiblings(originalMessages));
+                    auth.recordCore = annotated;
+                    if (auth.swappedCore) auth.swappedCore = annotated;
+                }
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log);
                 if (served !== null) {
-                    rebuiltContents = coreToGoogle(served, { model });
+                    rebuiltContents = coreToGoogle(served, { model, originalMessages });
                 }
             }
         }
@@ -519,7 +559,7 @@ export function prepareGoogleCountTokens(
         // counted, but nothing is adopted (state is discarded here too).
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
-        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model }) };
+        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model, originalMessages: msgs }) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify(rebuilt),

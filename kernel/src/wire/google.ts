@@ -6,7 +6,10 @@ import {
   deriveCanonicalMessageId,
   imageMediaFingerprint,
 } from "./identity.js";
-import type { BiliMessage } from "./bili-message.js";
+import {
+  GOOGLE_SIGNED_BATCH_SIBLING,
+  type BiliMessage,
+} from "./bili-message.js";
 
 // Gemini native wire (`generativelanguage.googleapis.com`, /v1beta/models/<m>:
 // generateContent|streamGenerateContent|countTokens). Two properties of this
@@ -359,8 +362,36 @@ export function normalizeGoogleUserPartOrder(
   return [...moved, ...rest];
 }
 
-const SIGNING_GEMINI_MODEL = /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i;
+const SIGNING_GEMINI_MODEL =
+  /(?:^|\/)gemini-(?:[3-9]|\d{2,}|(?:[a-z]+-)+latest$)(?:[.-]|$)/i;
 const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
+
+export function googleModelRequiresThoughtSignature(model: string): boolean {
+  return SIGNING_GEMINI_MODEL.test(model) && !CLAUDE_WIRE_MODEL.test(model);
+}
+
+/** Unsigned siblings proven by a signed predecessor in the same source batch. */
+export function googleSignedBatchSiblings(
+  messages: readonly BiliMessage[],
+): Set<string> {
+  const siblings = new Set<string>();
+  let signedWireIndex: number | undefined;
+  for (const m of messages) {
+    if (m.role !== "assistant" || m.contentType !== "tool-call") {
+      signedWireIndex = undefined;
+    } else if (m.googleThoughtSignature) {
+      signedWireIndex = m.wireIndex;
+    } else if (
+      signedWireIndex !== undefined &&
+      signedWireIndex === m.wireIndex
+    ) {
+      siblings.add(m.id);
+    } else {
+      signedWireIndex = undefined;
+    }
+  }
+  return siblings;
+}
 
 /** Rebuild Gemini `contents` from kernel messages. Runs of same-side cores
  *  are merged into ONE content (Gemini rejects non-alternating roles): an
@@ -384,12 +415,17 @@ const GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator";
  *  kernel/tests/issue3939-wire-byte-stability.test.ts. */
 export function coreToGoogle(
   messages: BiliMessage[],
-  opts?: { model?: string },
+  opts?: { model?: string; originalMessages?: readonly BiliMessage[] },
 ): GoogleContent[] {
   const out: GoogleContent[] = [];
-  const modelName = opts?.model ?? "";
+  const modelName = opts?.model;
   const requiresSignature =
-    SIGNING_GEMINI_MODEL.test(modelName) && !CLAUDE_WIRE_MODEL.test(modelName);
+    typeof modelName === "string" &&
+    googleModelRequiresThoughtSignature(modelName);
+  const signedSiblings =
+    requiresSignature && opts?.originalMessages
+      ? googleSignedBatchSiblings(opts.originalMessages)
+      : undefined;
   let model: {
     reasoning: GooglePart[];
     text: GooglePart[];
@@ -416,8 +452,19 @@ export function coreToGoogle(
       flushUser();
       if (!model) model = { reasoning: [], text: [], calls: [] };
       if (m.contentType === "reasoning") model.reasoning.push(reasoningPart(m));
-      else if (m.contentType === "tool-call") model.calls.push(toolCallPart(m));
-      else model.text.push(...contentParts(m));
+      else if (m.contentType === "tool-call") {
+        const part = toolCallPart(m);
+        // A legacy fold can promote a known parallel sibling to batch lead,
+        // even before the newest user input. Don't patch unrelated old calls.
+        model.calls.push(
+          model.calls.length === 0 &&
+            !part.thoughtSignature &&
+            requiresSignature &&
+            (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? signedSiblings?.has(m.id))
+            ? { ...part, thoughtSignature: GOOGLE_SIGNATURE_BYPASS }
+            : part,
+        );
+      } else model.text.push(...contentParts(m));
     } else {
       flushModel();
       if (!user) user = { responses: [], content: [] };

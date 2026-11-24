@@ -20,10 +20,17 @@
 
 import type { CoreMessage } from "acp-kernel";
 
+/** Request-local Google batch evidence. Symbols survive render copies but are
+ *  never serialized into the unified ledger or emitted on the wire. */
+export const GOOGLE_SIGNED_BATCH_SIBLING = Symbol("googleSignedBatchSibling");
+
 /** A message that carries its original protocol block(s) verbatim, so the
  *  reverse conversion can reconstruct losslessly. Every field is optional —
  *  plain text messages (the common case) have none set. */
 export interface BiliMessage extends CoreMessage {
+  /** An authoritative snapshot supplies true or false; undefined leaves batch
+   *  membership to the client's original history. */
+  [GOOGLE_SIGNED_BATCH_SIBLING]?: boolean;
   /** Anthropic: the original content block for an image, a structured
    *  tool_result, or a redacted_thinking block. Restored verbatim by
    *  coreToAnthropic (redacted_thinking must reach the wire byte-exact —

@@ -482,8 +482,8 @@ export function createGoogleAdapter(
     };
 
     return {
-        buildRequest(coreMessages, systemPrompt, body) {
-            const contents = coreToGoogle(coreMessages, { model: modelVersion });
+        buildRequest(coreMessages, systemPrompt, body, originalMessages) {
+            const contents = coreToGoogle(coreMessages, { model: modelVersion, originalMessages });
             if (notes && notes.length > 0) {
                 for (const text of notes) contents.push({ role: "user", parts: [{ text }] });
             }

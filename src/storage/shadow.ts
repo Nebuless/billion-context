@@ -1306,7 +1306,7 @@ export class UnifiedShadow {
      *  upgrade-tolerant interval path, contentHash for the exact-content
      *  dedup path). */
     /** #D5-5: identity-only rows (no content bytes) for the render lane. */
-    messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
+    messageIdRows(sessionId: string): { seq: number; msgId: string; kind: string }[] {
         if (this.sync === null) return [];
         return this.sync.messageIdRows(sessionId);
     }
@@ -1317,9 +1317,9 @@ export class UnifiedShadow {
         return this.sync.uncoveredRows(sessionId, intervals);
     }
 
-    tailViewRows(sessionId: string): MessageRow[] {
+    tailViewRows(sessionId: string, seqs?: readonly number[]): MessageRow[] {
         if (this.sync === null) return [];
-        return this.sync.getMessages(sessionId);
+        return this.sync.getMessages(sessionId, seqs === undefined ? undefined : { seqs });
     }
 
     /** #4738: per-ref stored message bodies (sync store only, like

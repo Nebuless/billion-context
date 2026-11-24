@@ -425,6 +425,7 @@ export interface CompressLoopAdapter {
         coreMessages: CoreMessage[],
         systemPrompt: string,
         requestBody: Record<string, unknown>,
+        originalMessages?: readonly CoreMessage[],
     ): Record<string, unknown>;
     parseStream(upstream: ReadableStream<Uint8Array>, round: number, opts?: ParseStreamOpts): AsyncGenerator<ParsedStreamEvent>;
     emitText(delta: string): Buffer;
@@ -865,7 +866,7 @@ export async function* runCompressLoop(
             const body = await buildThreadBody(extra);
             if (body !== undefined) return body;
         }
-        return withStrictEchoRepair(adapter.buildRequest(await rescaleForEncode([...coreMessages, ...extra]), systemPrompt, requestBody));
+        return withStrictEchoRepair(adapter.buildRequest(await rescaleForEncode([...coreMessages, ...extra]), systemPrompt, requestBody, ctx.compressMessages));
     };
     // The blind truncation retry re-sends roundBody byte-identical — on a
     // threads turn that re-continues the body's target. Allowed only while

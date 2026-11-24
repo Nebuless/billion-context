@@ -17,6 +17,7 @@
 //  7. storage unavailable: D quietly falls back to the legacy path.
 import assert from "node:assert/strict";
 import http from "node:http";
+import { Socket } from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 import { mkdtempSync } from "node:fs";
@@ -32,13 +33,14 @@ process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_STORAGE_UNIFIED = "shadow";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-snap-hermetic-")), "no-config.json");
 
-import { defaultConfig } from "acp-kernel";
-import { __setMessageIdSaltForTests } from "acp-kernel/wire";
+import { createCore, defaultConfig, defaultPrompts } from "acp-kernel";
+import { __setMessageIdSaltForTests, googleToCore, type GoogleContent } from "acp-kernel/wire";
 import { startServer } from "../src/server.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import { loadOptions, type ProxyOptions } from "../src/config.ts";
+import { prepareGoogle } from "../src/server/prepare-google.ts";
 import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { listSessions, _resetSessionsForTest } from "../src/session.ts";
+import { createSession, listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const SUMMARY = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK";
@@ -530,18 +532,23 @@ type GPart = { text?: unknown; thought?: boolean };
 type GContent = { role: string; parts: GPart[] };
 
 async function turnGoogle(h: Harness, label: string, messages: Msg[], history: Msg[] | null = null): Promise<{ status: number; body: string; idx: number }> {
-    const r = await fetch(h.googleUrl, {
+    const turn = await sendGoogleContents(h, label, "gemini-test", messages.map((m) => ({ role: m.role, parts: [{ text: m.content }] })));
+    if (history) for (const m of extractAssistantGoogle(turn.body)) history.push(m);
+    return turn;
+}
+
+async function sendGoogleContents(h: Harness, label: string, model: string, contents: GoogleContent[]): Promise<{ status: number; body: string; idx: number }> {
+    const r = await fetch(h.googleUrl.replace("/models/gemini-test:", `/models/${model}:`), {
         method: "POST",
         headers: { "content-type": "application/json", "x-acp-session": label },
         body: JSON.stringify({
-            model: "gemini-test",
-            contents: messages.map((m) => ({ role: m.role, parts: [{ text: m.content }] })),
+            model,
+            contents,
             generationConfig: { maxOutputTokens: 4096 },
         }),
     });
     const body = await r.text();
     await settleRows(h, label); // same anti-flake discipline as the openai turn(): rows must LAND before the next D view build
-    if (history) for (const m of extractAssistantGoogle(body)) history.push(m);
     return { status: r.status ?? 0, body, idx: h.bodies.length - 1 };
 }
 
@@ -647,6 +654,205 @@ test("D off (default) · google: the seed-upgrade scenario churns — documents 
         assert.equal(h.sessionOf("g-legacy")!.metadata["snapshotRenderTurns"], undefined, "no D latch");
     }, true);
 });
+
+for (const scenario of ["reminted split batch", "mismatched client batch", "non-signing model", "op-log authority", "op-log split batch replay", "op-log bootstrap split batch replay"] as const) {
+    test(`Google history rebuild: ${scenario}`, async (t) => {
+        process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+        const bootstrap = scenario === "op-log bootstrap split batch replay";
+        const replayFold = scenario === "op-log split batch replay" || bootstrap;
+        const authority = scenario === "op-log authority" || replayFold;
+        const nonSigning = scenario === "non-signing model";
+        if (authority) {
+            delete process.env.BILI_ROLLOUT_SNAPSHOT_RENDER;
+            const oldReconcile = process.env.BILI_FOLD_RECONCILE;
+            process.env.BILI_FOLD_RECONCILE = "off";
+            const old = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+            process.env.BILI_ROLLOUT_EGRESS_PLANE = bootstrap ? "0" : "100";
+            t.after(() => {
+                if (old === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+                else process.env.BILI_ROLLOUT_EGRESS_PLANE = old;
+                if (oldReconcile === undefined) delete process.env.BILI_FOLD_RECONCILE;
+                else process.env.BILI_FOLD_RECONCILE = oldReconcile;
+            });
+        }
+        await withHarness(async (h) => {
+            const model = nonSigning ? "gemini-2.5-pro" : "gemini-4-neon";
+            const signed = { functionCall: { name: "lookup", id: "head", args: { key: "head" } }, thoughtSignature: "fixture-signature" };
+            const unsigned = { functionCall: { name: "lookup", id: "sibling", args: { key: "sibling" } } };
+            const headResponse = { functionResponse: { name: "lookup", id: "head", response: { output: "head result" } } };
+            const siblingResponse = { functionResponse: { name: "lookup", id: "sibling", response: { output: "sibling result" } } };
+            const before = conversation().slice(0, 9).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+            const after = [{ role: "model", parts: [{ text: "Lookup complete" }] }, { role: "user", parts: [{ text: "Next question" }] }];
+            const split = scenario === "reminted split batch" || nonSigning;
+            const contents = (includeHead: boolean): GoogleContent[] => [
+                ...before,
+                { role: "model", parts: includeHead ? [signed, unsigned] : [unsigned] },
+                { role: "user", parts: includeHead ? [headResponse, siblingResponse] : [siblingResponse] },
+                ...after,
+            ];
+            const authoritySession = authority ? createSession("google-egress-authority", { protocol: "google" }) : undefined;
+            const send = async (contents: GoogleContent[]) => {
+                if (!authoritySession) return sendGoogleContents(h, scenario, model, contents);
+                const opts = loadOptions();
+                const config = defaultConfig(100_000);
+                const body = { contents, biliMsgIds: googleToCore({ contents }).msgs.map((m) => m.id) };
+                const req = new http.IncomingMessage(new Socket());
+                req.headers["x-bili-plugin"] = "pi";
+                const prepared = await prepareGoogle(body, opts, createCore(), config, defaultPrompts, {}, () => {}, authoritySession, true, 100_000, model, true, false, h.googleUrl, req);
+                const text = String(prepared.body);
+                return { status: 200, body: text, idx: h.bodies.push(text) - 1 };
+            };
+            const stored = contents(split || replayFold);
+            const first = await send(stored);
+            assert.equal(first.status, 200, first.body);
+            const session = authoritySession ?? listSessions().find((s) => s.meta.label === scenario);
+            assert.ok(session);
+            const storedMessages = googleToCore({ contents: stored }).msgs;
+            const coveredIds = split || authority
+                ? googleToCore({ contents: contents(true) }).msgs.filter((m) => m.toolCallId === "head").map((m) => m.id)
+                : storedMessages.slice(1, 4).map((m) => m.id);
+            // Seed the fold independently of the current atomicity rules.
+            session.state.blocks = [{
+                blockId: "b_legacy_signature",
+                runId: "r_legacy_signature",
+                tier: 1,
+                summary: SUMMARY,
+                directMessageIds: coveredIds,
+                effectiveMessageIds: coveredIds,
+                directBlockIds: [],
+                compressedTokens: 100,
+                createdAt: 1,
+                survivedCount: 0,
+                generation: "young",
+                active: true,
+            }];
+            if (scenario === "reminted split batch") {
+                __setMessageIdSaltForTests("snapshot-signature-v2");
+            }
+            // This is a pre-existing fold, not a rewind of the seed turn.
+            if (authority) session.state.lastPassIds = undefined;
+            const store = getStore();
+            if (bootstrap) {
+                assert.equal(store.egressOpLogStore()?.egressStateMaxSeq(session.id), 0, "the legacy fold predates the op log");
+                process.env.BILI_ROLLOUT_EGRESS_PLANE = "100";
+            }
+            const read = nonSigning ? t.mock.method(store, "unifiedTailViewRows") : undefined;
+            const replay = [...contents(true), { role: "user", parts: [{ text: "Latest question" }] }];
+            const second = await send(replay);
+            assert.equal(second.status, 200, second.body);
+            if (authority) {
+                assert.equal(session.metadata.egressAuthority, true);
+                assert.equal(session.metadata.snapshotRenderTurns, undefined);
+            } else {
+                assertDActive(h, scenario, 1, "historical Google tool call came from the snapshot");
+            }
+            const outbound = JSON.parse(h.bodies[second.idx]) as { contents: GoogleContent[] };
+            const tools = outbound.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
+            const expected = [scenario === "reminted split batch" || replayFold ? { ...unsigned, thoughtSignature: "skip_thought_signature_validator" } : unsigned, siblingResponse];
+            assert.deepEqual(tools, expected, "first rebuild after the fold");
+            if (replayFold) {
+                const opLog = store.egressOpLogStore();
+                assert.ok(opLog);
+                assert.ok(opLog.egressStateMaxSeq(session.id) > 0, "the folded view was persisted");
+                if (!bootstrap) assert.ok(opLog.egressStateBaseSeq(session.id) > 0, "the fold compacted an existing log");
+                assert.ok(opLog.egressStateView(session.id).every((row) => !coveredIds.includes(row.msgid)), "the signed predecessor is no longer in the op log view");
+                const third = await send([...contents(false), { role: "user", parts: [{ text: "Replay without the signed predecessor" }] }]);
+                const replayed = JSON.parse(h.bodies[third.idx]) as { contents: GoogleContent[] };
+                const replayedTools = replayed.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
+                assert.deepEqual(replayedTools, expected, "next rebuild from the persisted fold");
+            }
+            if (read) assert.deepEqual(read.mock.calls.flatMap(({ arguments: [, seqs] }) => seqs ?? []), [], "non-signing models must not request covered batch evidence");
+        }, true);
+    });
+}
+
+// Round-3 regressions: the signed-batch proof must reach EVERY op-log row
+// written for a signed batch (first sight on a non-empty log) and a record-only
+// (unpinned) turn must never downgrade proof already on disk. Both reopen the
+// SQLite sidecar before the final replay so the proof is read from disk.
+for (const scenario of ["first sight on a non-empty log", "record-only turn keeps stored proof"] as const) {
+    test(`Google op-log batch provenance: ${scenario}`, async (t) => {
+        const saved = { egress: process.env.BILI_ROLLOUT_EGRESS_PLANE, reconcile: process.env.BILI_FOLD_RECONCILE };
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "100";
+        process.env.BILI_FOLD_RECONCILE = "off";
+        t.after(() => {
+            if (saved.egress === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+            else process.env.BILI_ROLLOUT_EGRESS_PLANE = saved.egress;
+            if (saved.reconcile === undefined) delete process.env.BILI_FOLD_RECONCILE;
+            else process.env.BILI_FOLD_RECONCILE = saved.reconcile;
+        });
+        await withHarness(async (h) => {
+            const model = "gemini-4-neon";
+            const signed = { functionCall: { name: "lookup", id: "head", args: { key: "head" } }, thoughtSignature: "fixture-signature" };
+            const unsigned = { functionCall: { name: "lookup", id: "sibling", args: { key: "sibling" } } };
+            const headResponse = { functionResponse: { name: "lookup", id: "head", response: { output: "head result" } } };
+            const siblingResponse = { functionResponse: { name: "lookup", id: "sibling", response: { output: "sibling result" } } };
+            const before = conversation().slice(0, 9).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+            const after = [{ role: "model", parts: [{ text: "Lookup complete" }] }, { role: "user", parts: [{ text: "Next question" }] }];
+            const contents = (includeHead: boolean, tail: string): GoogleContent[] => [
+                ...before,
+                { role: "model", parts: includeHead ? [signed, unsigned] : [unsigned] },
+                { role: "user", parts: includeHead ? [headResponse, siblingResponse] : [siblingResponse] },
+                ...after,
+                { role: "user", parts: [{ text: tail }] },
+            ];
+            const session = createSession("google-egress-provenance", { protocol: "google" });
+            const send = async (contents: GoogleContent[], pinned = true) => {
+                const body = pinned ? { contents, biliMsgIds: googleToCore({ contents }).msgs.map((m) => m.id) } : { contents };
+                const req = new http.IncomingMessage(new Socket());
+                req.headers["x-bili-plugin"] = "pi";
+                const prepared = await prepareGoogle(body, loadOptions(), createCore(), defaultConfig(100_000), defaultPrompts, {}, () => {}, session, true, 100_000, model, true, false, h.googleUrl, req);
+                const outbound = JSON.parse(String(prepared.body)) as { contents: GoogleContent[] };
+                return outbound.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
+            };
+            const expected = [{ ...unsigned, thoughtSignature: "skip_thought_signature_validator" }, siblingResponse];
+            const headIds = googleToCore({ contents: contents(true, "x") }).msgs.filter((m) => m.toolCallId === "head").map((m) => m.id);
+            const foldHead = () => {
+                session.state.blocks = [{
+                    blockId: "b_legacy_signature",
+                    runId: "r_legacy_signature",
+                    tier: 1,
+                    summary: SUMMARY,
+                    directMessageIds: headIds,
+                    effectiveMessageIds: headIds,
+                    directBlockIds: [],
+                    compressedTokens: 100,
+                    createdAt: 1,
+                    survivedCount: 0,
+                    generation: "young",
+                    active: true,
+                }];
+                session.state.lastPassIds = undefined;
+            };
+            if (scenario === "first sight on a non-empty log") {
+                await send(before);
+                assert.ok((getStore().egressOpLogStore()?.egressStateMaxSeq(session.id) ?? 0) > 0, "earlier history seeded the log");
+                foldHead();
+            } else {
+                await send(contents(true, "Seed question"));
+                foldHead();
+            }
+            // The batch's leader is folded away on this rebuild: the sibling is
+            // promoted and must carry the bypass, and its op-log row the proof.
+            assert.deepEqual(await send(contents(true, "Latest question")), expected, "first rebuild after the fold");
+            if (scenario === "record-only turn keeps stored proof") {
+                await send(contents(false, "Unpinned question"), false);
+            }
+            const dir = getStore().dir;
+            getStore().closeQuietly();
+            const reopened = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+            _setStoreForTest(reopened);
+            try {
+                const opLog = reopened.egressOpLogStore();
+                assert.ok(opLog && opLog.egressStateMaxSeq(session.id) > 0, "the op log survived the reopen");
+                assert.ok(opLog.egressStateView(session.id).every((row) => !headIds.includes(row.msgid)), "the signed predecessor is no longer in the op log view");
+                assert.deepEqual(await send(contents(false, "Replay without the signed predecessor")), expected, "replay from the reopened op log");
+            } finally {
+                reopened.closeQuietly();
+            }
+        }, true);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // #3812 stakes: the identity signature has no id component, so repeated short
