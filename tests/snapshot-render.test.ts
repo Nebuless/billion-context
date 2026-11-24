@@ -655,10 +655,11 @@ test("D off (default) · google: the seed-upgrade scenario churns — documents 
     }, true);
 });
 
-for (const scenario of ["reminted split batch", "mismatched client batch", "non-signing model", "op-log authority"] as const) {
+for (const scenario of ["reminted split batch", "mismatched client batch", "non-signing model", "op-log authority", "op-log split batch replay"] as const) {
     test(`Google history rebuild: ${scenario}`, async (t) => {
         process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
-        const authority = scenario === "op-log authority";
+        const replayFold = scenario === "op-log split batch replay";
+        const authority = scenario === "op-log authority" || replayFold;
         const nonSigning = scenario === "non-signing model";
         if (authority) {
             delete process.env.BILI_ROLLOUT_SNAPSHOT_RENDER;
@@ -700,7 +701,7 @@ for (const scenario of ["reminted split batch", "mismatched client batch", "non-
                 const text = String(prepared.body);
                 return { status: 200, body: text, idx: h.bodies.push(text) - 1 };
             };
-            const stored = contents(split);
+            const stored = contents(split || replayFold);
             const first = await send(stored);
             assert.equal(first.status, 200, first.body);
             const session = authoritySession ?? listSessions().find((s) => s.meta.label === scenario);
@@ -742,7 +743,18 @@ for (const scenario of ["reminted split batch", "mismatched client batch", "non-
             }
             const outbound = JSON.parse(h.bodies[second.idx]) as { contents: GoogleContent[] };
             const tools = outbound.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
-            assert.deepEqual(tools, [scenario === "reminted split batch" ? { ...unsigned, thoughtSignature: "skip_thought_signature_validator" } : unsigned, siblingResponse]);
+            const expected = [scenario === "reminted split batch" || replayFold ? { ...unsigned, thoughtSignature: "skip_thought_signature_validator" } : unsigned, siblingResponse];
+            assert.deepEqual(tools, expected, "first rebuild after the fold");
+            if (replayFold) {
+                const opLog = store.egressOpLogStore();
+                assert.ok(opLog);
+                assert.ok(opLog.egressStateBaseSeq(session.id) > 0, "the fold was persisted and compacted");
+                assert.ok(opLog.egressStateView(session.id).every((row) => !coveredIds.includes(row.msgid)), "the signed predecessor is no longer in the op log view");
+                const third = await send([...contents(false), { role: "user", parts: [{ text: "Replay without the signed predecessor" }] }]);
+                const replayed = JSON.parse(h.bodies[third.idx]) as { contents: GoogleContent[] };
+                const replayedTools = replayed.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
+                assert.deepEqual(replayedTools, expected, "next rebuild from the persisted fold");
+            }
             if (read) assert.deepEqual(read.mock.calls.flatMap(({ arguments: [, seqs] }) => seqs ?? []), [], "non-signing models must not request covered batch evidence");
         }, true);
     });

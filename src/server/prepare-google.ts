@@ -45,6 +45,8 @@ import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
 
+type GoogleEgressMessage = BiliMessage & { readonly egressGoogleSignedBatchSibling?: true };
+
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
     if (last && (last.role ?? "user") !== "model") {
@@ -401,19 +403,22 @@ export async function prepareGoogle(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
+                if (auth.storedCore && auth.swappedCore) {
+                    const storedRows = new Set(auth.storedCore);
+                    const siblings = googleSignedBatchSiblings(auth.storedCore);
+                    // Persist proof before compaction drops the signed predecessor.
+                    // The render-only symbol still rejects client evidence for stored rows.
+                    const annotated = auth.swappedCore.map((m: GoogleEgressMessage): GoogleEgressMessage => {
+                        if (!storedRows.has(m) || m.contentType !== "tool-call") return m;
+                        return m.egressGoogleSignedBatchSibling === true || siblings.has(m.id)
+                            ? { ...m, egressGoogleSignedBatchSibling: true, [GOOGLE_SIGNED_BATCH_SIBLING]: true }
+                            : { ...m, [GOOGLE_SIGNED_BATCH_SIBLING]: false };
+                    });
+                    auth.recordCore = auth.swappedCore = annotated;
+                }
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log);
                 if (served !== null) {
-                    let wireMessages = served;
-                    if (googleBatchEvidence && auth.storedCore) {
-                        const storedRows = new Set(auth.storedCore);
-                        const siblings = googleSignedBatchSiblings(auth.storedCore);
-                        // Use the objects selected by the swap, not matching
-                        // client ids. False explicitly rejects client evidence.
-                        wireMessages = served.map((m) => storedRows.has(m) && m.contentType === "tool-call"
-                            ? { ...m, [GOOGLE_SIGNED_BATCH_SIBLING]: siblings.has(m.id) }
-                            : m);
-                    }
-                    rebuiltContents = coreToGoogle(wireMessages, { model, originalMessages });
+                    rebuiltContents = coreToGoogle(served, { model, originalMessages });
                 }
             }
         }
