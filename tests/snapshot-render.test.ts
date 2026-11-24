@@ -766,6 +766,94 @@ for (const scenario of ["reminted split batch", "mismatched client batch", "non-
     });
 }
 
+// Round-3 regressions: the signed-batch proof must reach EVERY op-log row
+// written for a signed batch (first sight on a non-empty log) and a record-only
+// (unpinned) turn must never downgrade proof already on disk. Both reopen the
+// SQLite sidecar before the final replay so the proof is read from disk.
+for (const scenario of ["first sight on a non-empty log", "record-only turn keeps stored proof"] as const) {
+    test(`Google op-log batch provenance: ${scenario}`, async (t) => {
+        const saved = { egress: process.env.BILI_ROLLOUT_EGRESS_PLANE, reconcile: process.env.BILI_FOLD_RECONCILE };
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "100";
+        process.env.BILI_FOLD_RECONCILE = "off";
+        t.after(() => {
+            if (saved.egress === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+            else process.env.BILI_ROLLOUT_EGRESS_PLANE = saved.egress;
+            if (saved.reconcile === undefined) delete process.env.BILI_FOLD_RECONCILE;
+            else process.env.BILI_FOLD_RECONCILE = saved.reconcile;
+        });
+        await withHarness(async (h) => {
+            const model = "gemini-4-neon";
+            const signed = { functionCall: { name: "lookup", id: "head", args: { key: "head" } }, thoughtSignature: "fixture-signature" };
+            const unsigned = { functionCall: { name: "lookup", id: "sibling", args: { key: "sibling" } } };
+            const headResponse = { functionResponse: { name: "lookup", id: "head", response: { output: "head result" } } };
+            const siblingResponse = { functionResponse: { name: "lookup", id: "sibling", response: { output: "sibling result" } } };
+            const before = conversation().slice(0, 9).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+            const after = [{ role: "model", parts: [{ text: "Lookup complete" }] }, { role: "user", parts: [{ text: "Next question" }] }];
+            const contents = (includeHead: boolean, tail: string): GoogleContent[] => [
+                ...before,
+                { role: "model", parts: includeHead ? [signed, unsigned] : [unsigned] },
+                { role: "user", parts: includeHead ? [headResponse, siblingResponse] : [siblingResponse] },
+                ...after,
+                { role: "user", parts: [{ text: tail }] },
+            ];
+            const session = createSession("google-egress-provenance", { protocol: "google" });
+            const send = async (contents: GoogleContent[], pinned = true) => {
+                const body = pinned ? { contents, biliMsgIds: googleToCore({ contents }).msgs.map((m) => m.id) } : { contents };
+                const req = new http.IncomingMessage(new Socket());
+                req.headers["x-bili-plugin"] = "pi";
+                const prepared = await prepareGoogle(body, loadOptions(), createCore(), defaultConfig(100_000), defaultPrompts, {}, () => {}, session, true, 100_000, model, true, false, h.googleUrl, req);
+                const outbound = JSON.parse(String(prepared.body)) as { contents: GoogleContent[] };
+                return outbound.contents.flatMap((c) => c.parts.filter((p) => p.functionCall?.name === "lookup" || p.functionResponse?.name === "lookup"));
+            };
+            const expected = [{ ...unsigned, thoughtSignature: "skip_thought_signature_validator" }, siblingResponse];
+            const headIds = googleToCore({ contents: contents(true, "x") }).msgs.filter((m) => m.toolCallId === "head").map((m) => m.id);
+            const foldHead = () => {
+                session.state.blocks = [{
+                    blockId: "b_legacy_signature",
+                    runId: "r_legacy_signature",
+                    tier: 1,
+                    summary: SUMMARY,
+                    directMessageIds: headIds,
+                    effectiveMessageIds: headIds,
+                    directBlockIds: [],
+                    compressedTokens: 100,
+                    createdAt: 1,
+                    survivedCount: 0,
+                    generation: "young",
+                    active: true,
+                }];
+                session.state.lastPassIds = undefined;
+            };
+            if (scenario === "first sight on a non-empty log") {
+                await send(before);
+                assert.ok((getStore().egressOpLogStore()?.egressStateMaxSeq(session.id) ?? 0) > 0, "earlier history seeded the log");
+                foldHead();
+            } else {
+                await send(contents(true, "Seed question"));
+                foldHead();
+            }
+            // The batch's leader is folded away on this rebuild: the sibling is
+            // promoted and must carry the bypass, and its op-log row the proof.
+            assert.deepEqual(await send(contents(true, "Latest question")), expected, "first rebuild after the fold");
+            if (scenario === "record-only turn keeps stored proof") {
+                await send(contents(false, "Unpinned question"), false);
+            }
+            const dir = getStore().dir;
+            getStore().closeQuietly();
+            const reopened = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+            _setStoreForTest(reopened);
+            try {
+                const opLog = reopened.egressOpLogStore();
+                assert.ok(opLog && opLog.egressStateMaxSeq(session.id) > 0, "the op log survived the reopen");
+                assert.ok(opLog.egressStateView(session.id).every((row) => !headIds.includes(row.msgid)), "the signed predecessor is no longer in the op log view");
+                assert.deepEqual(await send(contents(false, "Replay without the signed predecessor")), expected, "replay from the reopened op log");
+            } finally {
+                reopened.closeQuietly();
+            }
+        }, true);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // #3812 stakes: the identity signature has no id component, so repeated short
 // texts ("继续"/yes/1) let a single sig hit masquerade as a seam and silently

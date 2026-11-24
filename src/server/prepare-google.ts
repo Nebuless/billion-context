@@ -44,8 +44,37 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { egressAuthorityArmed, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { rebuildCoreFromLog } from "../storage/egress-serve.js";
 
 type GoogleEgressMessage = BiliMessage & { readonly egressGoogleSignedBatchSibling?: true };
+
+/**
+ * Attach persisted signed-batch proof to every Google tool-call row written to the op log.
+ * Stored proof is never downgraded. Rows served from the log (identity members of
+ * `stored`) take their proof only from the log, so the render-only symbol rejects
+ * client evidence for them; fresh client rows keep the client's batch evidence.
+ */
+function withGoogleBatchProvenance(
+    rows: readonly GoogleEgressMessage[],
+    stored: readonly GoogleEgressMessage[],
+    clientSiblings: ReadonlySet<string>,
+): GoogleEgressMessage[] {
+    const storedRows = new Set(stored);
+    const storedProof = googleSignedBatchSiblings(stored);
+    for (const m of stored) if (m.egressGoogleSignedBatchSibling === true) storedProof.add(m.id);
+    return rows.map((m) => {
+        if (m.contentType !== "tool-call") return m;
+        const proven = storedProof.has(m.id);
+        if (storedRows.has(m)) {
+            return proven
+                ? { ...m, egressGoogleSignedBatchSibling: true, [GOOGLE_SIGNED_BATCH_SIBLING]: true }
+                : { ...m, [GOOGLE_SIGNED_BATCH_SIBLING]: false };
+        }
+        return proven || (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? clientSiblings.has(m.id))
+            ? { ...m, egressGoogleSignedBatchSibling: true }
+            : m;
+    });
+}
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -403,24 +432,13 @@ export async function prepareGoogle(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
-                if (auth.bootstrapping && auth.recordCore) {
-                    const siblings = googleSignedBatchSiblings(originalMessages);
-                    auth.recordCore = auth.recordCore.map((m): GoogleEgressMessage =>
-                        m.contentType === "tool-call" && (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? siblings.has(m.id))
-                            ? { ...m, egressGoogleSignedBatchSibling: true }
-                            : m);
-                } else if (auth.storedCore && auth.swappedCore) {
-                    const storedRows = new Set(auth.storedCore);
-                    const siblings = googleSignedBatchSiblings(auth.storedCore);
-                    // Persist proof before compaction drops the signed predecessor.
-                    // The render-only symbol still rejects client evidence for stored rows.
-                    const annotated = auth.swappedCore.map((m: GoogleEgressMessage): GoogleEgressMessage => {
-                        if (!storedRows.has(m) || m.contentType !== "tool-call") return m;
-                        return m.egressGoogleSignedBatchSibling === true || siblings.has(m.id)
-                            ? { ...m, egressGoogleSignedBatchSibling: true, [GOOGLE_SIGNED_BATCH_SIBLING]: true }
-                            : { ...m, [GOOGLE_SIGNED_BATCH_SIBLING]: false };
-                    });
-                    auth.recordCore = auth.swappedCore = annotated;
+                if (auth.recordCore?.some((m) => m.contentType === "tool-call")) {
+                    // One write path for every op-log turn (bootstrap, swap, record-only):
+                    // persist batch proof before compaction drops the signed predecessor.
+                    const stored = auth.storedCore ?? rebuildCoreFromLog(auth.base) ?? [];
+                    const annotated = withGoogleBatchProvenance(auth.recordCore, stored, googleSignedBatchSiblings(originalMessages));
+                    auth.recordCore = annotated;
+                    if (auth.swappedCore) auth.swappedCore = annotated;
                 }
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log);
                 if (served !== null) {
