@@ -1,0 +1,48 @@
+name: Blacksmith Linux CI
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (Linux, Node ${{ matrix.node-version }}, shard ${{ matrix.shard }}/3)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Restore kernel dist cache (#4360)
+        uses: actions/cache@v4
+        with:
+          path: kernel/dist
+          key: pretest-dist-kernel-v1-${{ runner.os }}-${{ hashFiles('kernel/src/**', 'kernel/tsup.config.ts', 'kernel/tsconfig.json', 'kernel/package.json', 'kernel/package-lock.json', 'package-lock.json') }}
+      - name: Restore pi-subagents dist cache (#4360)
+        uses: actions/cache@v4
+        with:
+          path: pi-subagents/dist
+          key: pretest-dist-pisub-v1-${{ runner.os }}-${{ hashFiles('pi-subagents/src/**', 'pi-subagents/tsup.config.ts', 'pi-subagents/tsconfig.json', 'pi-subagents/package.json', 'package-lock.json') }}
+      - run: npm install --ignore-scripts --no-fund --no-audit
+      - run: node scripts/run-ci-tests.mjs
+        env:
+          ACP_TEST_CLAUDE_NATIVE: "1"
+          CI_TEST_SHARD: ${{ matrix.shard }}/3
