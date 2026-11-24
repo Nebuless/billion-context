@@ -403,7 +403,13 @@ export async function prepareGoogle(
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinned, sideRequest: isTitleGen });
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
-                if (auth.storedCore && auth.swappedCore) {
+                if (auth.bootstrapping && auth.recordCore) {
+                    const siblings = googleSignedBatchSiblings(originalMessages);
+                    auth.recordCore = auth.recordCore.map((m): GoogleEgressMessage =>
+                        m.contentType === "tool-call" && (m[GOOGLE_SIGNED_BATCH_SIBLING] ?? siblings.has(m.id))
+                            ? { ...m, egressGoogleSignedBatchSibling: true }
+                            : m);
+                } else if (auth.storedCore && auth.swappedCore) {
                     const storedRows = new Set(auth.storedCore);
                     const siblings = googleSignedBatchSiblings(auth.storedCore);
                     // Persist proof before compaction drops the signed predecessor.

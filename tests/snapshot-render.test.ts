@@ -655,10 +655,11 @@ test("D off (default) · google: the seed-upgrade scenario churns — documents 
     }, true);
 });
 
-for (const scenario of ["reminted split batch", "mismatched client batch", "non-signing model", "op-log authority", "op-log split batch replay"] as const) {
+for (const scenario of ["reminted split batch", "mismatched client batch", "non-signing model", "op-log authority", "op-log split batch replay", "op-log bootstrap split batch replay"] as const) {
     test(`Google history rebuild: ${scenario}`, async (t) => {
         process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
-        const replayFold = scenario === "op-log split batch replay";
+        const bootstrap = scenario === "op-log bootstrap split batch replay";
+        const replayFold = scenario === "op-log split batch replay" || bootstrap;
         const authority = scenario === "op-log authority" || replayFold;
         const nonSigning = scenario === "non-signing model";
         if (authority) {
@@ -666,7 +667,7 @@ for (const scenario of ["reminted split batch", "mismatched client batch", "non-
             const oldReconcile = process.env.BILI_FOLD_RECONCILE;
             process.env.BILI_FOLD_RECONCILE = "off";
             const old = process.env.BILI_ROLLOUT_EGRESS_PLANE;
-            process.env.BILI_ROLLOUT_EGRESS_PLANE = "100";
+            process.env.BILI_ROLLOUT_EGRESS_PLANE = bootstrap ? "0" : "100";
             t.after(() => {
                 if (old === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
                 else process.env.BILI_ROLLOUT_EGRESS_PLANE = old;
@@ -731,6 +732,10 @@ for (const scenario of ["reminted split batch", "mismatched client batch", "non-
             // This is a pre-existing fold, not a rewind of the seed turn.
             if (authority) session.state.lastPassIds = undefined;
             const store = getStore();
+            if (bootstrap) {
+                assert.equal(store.egressOpLogStore()?.egressStateMaxSeq(session.id), 0, "the legacy fold predates the op log");
+                process.env.BILI_ROLLOUT_EGRESS_PLANE = "100";
+            }
             const read = nonSigning ? t.mock.method(store, "unifiedTailViewRows") : undefined;
             const replay = [...contents(true), { role: "user", parts: [{ text: "Latest question" }] }];
             const second = await send(replay);
@@ -748,7 +753,8 @@ for (const scenario of ["reminted split batch", "mismatched client batch", "non-
             if (replayFold) {
                 const opLog = store.egressOpLogStore();
                 assert.ok(opLog);
-                assert.ok(opLog.egressStateBaseSeq(session.id) > 0, "the fold was persisted and compacted");
+                assert.ok(opLog.egressStateMaxSeq(session.id) > 0, "the folded view was persisted");
+                if (!bootstrap) assert.ok(opLog.egressStateBaseSeq(session.id) > 0, "the fold compacted an existing log");
                 assert.ok(opLog.egressStateView(session.id).every((row) => !coveredIds.includes(row.msgid)), "the signed predecessor is no longer in the op log view");
                 const third = await send([...contents(false), { role: "user", parts: [{ text: "Replay without the signed predecessor" }] }]);
                 const replayed = JSON.parse(h.bodies[third.idx]) as { contents: GoogleContent[] };
