@@ -29,6 +29,8 @@
 
 ## 工程与运维
 
+架构评审快照：[2026-11-26 深化候选](architecture-review-2026-11-26.zh-CN.md) / [English](architecture-review-2026-11-26.md)；[研究交接](handoff.zh-CN.md) / [English](handoff.md)。可视 HTML 仅英文；中英文文本均记录结论。
+
 | 文档 | 说明 |
 |---|---|
 | [technical-notes](technical-notes.zh-CN.md) / [English](technical-notes.md) / [日本語](technical-notes.ja.md) | 机制深潜大杂烩（wire 行为、双压缩模式、快路径） |

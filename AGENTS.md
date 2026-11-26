@@ -4,6 +4,10 @@
 >
 > **How to read this:** the rules and invariants below are loaded every session and are the operative contract. Long procedures, file listings, and test/release/git mechanics live in [`reference/`](reference/) and are **not** auto-loaded — follow the inline `→ reference/…` pointers when you hit that task; don't guess at a procedure, open the file. The Key Design Decisions (KDD) below carry each entry's **operative consequence**; the full mechanism text (Tier B entries) lives verbatim in [reference/design-decisions.md](reference/design-decisions.md) — KDD numbering is stable and public, the ledger there is append-only.
 
+## Next research phase
+
+Continue the architecture review using [docs/handoff.md](docs/handoff.md): revalidate the preflight lifecycle and decision-text discrepancies against the current tree, then select a candidate with the owner before designing or implementing it.
+
 ## 1. Project Overview
 
 **billion-context** is an npm package (`bili` CLI) — a context-compression proxy for AI agents. It sits between an agent client and an upstream LLM provider, injecting acp-kernel's compression pipeline to manage context growth.

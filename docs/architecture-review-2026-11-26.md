@@ -1,0 +1,21 @@
+# Architecture review: deepening opportunities
+
+Review snapshot: 2026-11-26, repository commit `2c2190f80e8077a094df3aab50189387e852d6b1`. These are research candidates, not approved designs or established defects. Method: [improve-codebase-architecture](https://github.com/mattpocock/skills/tree/main/skills/engineering/improve-codebase-architecture); recent request-pipeline and storage/identity changes guided sampling. [Visual report](architecture-review-2026-11-26.html) (English only; this document and its Chinese counterpart carry the findings). No glossary or ADR directory was found. Two researchers reported independently; a separate OMO session synthesized them, but its own subagent could not start because delegation tools were inactive. Source and tests were inspected, not executed. This was not an exhaustive audit.
+
+## Ranked candidates
+
+1. **Strong — preflight one-shot lifecycle.** The gate in `src/server.ts:4219–4252`, abort handling at `src/server.ts:4709–4723`, epoch rearming in `src/fold-reconcile.ts:2512–2521`, reset and persistence split lifecycle knowledge. Explore concentrating transitions rather than wrapping a boolean. Deleting the gate would redistribute its rules, not eliminate them. This could improve locality and transition-test leverage. Preserve fast-failure retry, fork inheritance and epoch behavior; retain request-level coverage in `tests/preflight-one-shot-gate.test.ts`.
+2. **Strong, semantically sensitive — msgid pin judgment.** `src/snapshot/stage0.ts:145–282` and `src/server/prepare-anthropic.ts:243–299` both participate in full/tail judgment, but do not assume their policies are identical. Explore shared judgment with explicit lane-specific behavior. Deleting either coordinator would move policy into callers. Test actual wire paths, empty-ledger and malformed-tail cases, precedence and overlap; preserve KDD #21–22 and `tests/issue5874-2x2-p3.test.ts`.
+3. **Worth exploring — egress authority turn lifecycle.** `src/server/egress-lane-io.ts:132–262` already centralizes authority; `src/server/prepare-openai.ts:366–383,697–719,955–975` retains separate recording and ordering knowledge. Deleting the existing seam would spread real policy. Investigate residual coordination without flattening pre-kernel versus post-kernel ordering. Preserve KDD #23, failure handling and record-before-serve; test actual adapters alongside `tests/issue7574-egress-seam.test.ts`.
+4. **Worth exploring — response commitment and upstream size verdicts.** Early commitment in `src/server.ts:3530–3573` interacts with relay outcomes at `src/server/relay.ts:2179–2240`. Removing either mechanism redistributes the lifecycle problem. Explore locality of committed/uncommitted handling; test streaming and non-streaming outcomes across size and non-size failures. Headers cannot be amended after commitment; KDD #19 forbids estimate-based refusal.
+5. **Speculative — projection authority.** `src/storage/store.ts:2079–2113` chooses pin sources, while `src/persist.ts:2839–2851,3327–3354` handles replica and projection decisions. Their semantics differ; deleting the pin seam would scatter source selection. Clarify ownership and add integration evidence before considering consolidation. Preserve KDD #23 and `tests/egress-lazy-projection.test.ts`.
+
+## Unresolved decision-text discrepancies
+
+- KDD #7, `docs/technical-notes.md:188–212` and conditional nudge paths need a precise plugin-mode trace before choosing a correction.
+- KDD #19 describes JSON evidence merging; `src/server/relay.ts:2179–2217` preserves upstream bodies and adds headers when possible. Clarify intended contract, including already-committed responses.
+- KDD #9's persona summary appears broader than the qualified path at `src/server/handle.ts:1546–1570`; verify the operative decision before changing identity logic.
+
+## Next phase
+
+Research the preflight lifecycle first, confirm source-level transition and fork/persistence behavior, and map request-level tests in both compression modes. Independently investigate the three decision-text discrepancies; do not infer that source or documentation is correct without owner clarification. Select a candidate with the owner before designing interfaces or implementing changes. All findings are tied to the review snapshot and must be revalidated against the current tree.

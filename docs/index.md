@@ -29,6 +29,8 @@
 
 ## Engineering & operations
 
+Architecture review snapshot: [2026-11-26 deepening candidates](architecture-review-2026-11-26.md) / [中文](architecture-review-2026-11-26.zh-CN.md); [research handoff](handoff.md) / [中文](handoff.zh-CN.md). Its visual HTML is English-only; both text reports carry the findings.
+
 | Doc | What it is |
 |---|---|
 | [technical-notes](technical-notes.md) / [中文](technical-notes.zh-CN.md) / [日本語](technical-notes.ja.md) | Large compendium of mechanism deep-dives (wire behavior, compression modes, fastpaths) |
